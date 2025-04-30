@@ -10,7 +10,7 @@ const routes = [
 ];
 
 const router = createRouter({
-  history: createWebHistory('/upload'),
+  history: createWebHistory('/gh-upload/'),
   routes
 });
 
