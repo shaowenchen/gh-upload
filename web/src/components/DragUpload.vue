@@ -46,7 +46,7 @@
       <div class="example-btn">
         <file-upload
           class="btn btn-primary"
-          post-action="https://uploadapi.chenshaowen.com/api/v1/files"
+          post-action="https://gh-uploadapi.chenshaowen.com/api/v1/files"
           :multiple="true"
           :drop="true"
           :drop-directory="true"
