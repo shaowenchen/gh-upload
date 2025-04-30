@@ -11,4 +11,7 @@ module.exports = {
     });
   },
   assetsDir: "static",
+  publicPath: process.env.NODE_ENV === 'production'
+    ? '/gh-upload/'
+    : '/'
 };
