@@ -67,7 +67,7 @@ func (g *GitHubClient) GetRepoBranchSize(repo *github.Repository, branch string)
 		false,
 	)
 	if err == nil {
-		size, _, _, err := g.client.Repositories.GetContents(
+		_, contents, _, err := g.client.Repositories.GetContents(
 			context.TODO(),
 			g.config.DataGroup,
 			repo.GetName(),
@@ -78,23 +78,50 @@ func (g *GitHubClient) GetRepoBranchSize(repo *github.Repository, branch string)
 		if err != nil {
 			fmt.Println(err)
 			return 0
-		} else {
-			return size.GetSize()
 		}
+		// 计算所有文件的总大小
+		totalSize := 0
+		if contents != nil {
+			for _, content := range contents {
+				if content.GetType() == "file" {
+					totalSize += content.GetSize()
+				}
+			}
+		}
+		return totalSize
 	} else {
+		// 获取默认分支的最新 commit SHA
+		defaultBranch := repo.GetDefaultBranch()
+		if defaultBranch == "" {
+			defaultBranch = "main"
+		}
+		defaultBranchRef, _, err := g.client.Repositories.GetBranch(
+			context.TODO(),
+			g.config.DataGroup,
+			repo.GetName(),
+			defaultBranch,
+			false,
+		)
+		if err != nil {
+			fmt.Printf("Error getting default branch %s: %v\n", defaultBranch, err)
+			return 0
+		}
+
+		// 使用默认分支的最新 commit SHA 创建新分支
+		sha := defaultBranchRef.GetCommit().GetSHA()
 		newBranch := &github.Reference{
 			Ref:    github.String("refs/heads/" + branch),
-			Object: &github.GitObject{SHA: github.String(branch)},
+			Object: &github.GitObject{SHA: github.String(sha)},
 		}
-		_, _, err := g.client.Git.CreateRef(
+		_, _, err = g.client.Git.CreateRef(
 			context.TODO(),
 			g.config.DataGroup,
 			repo.GetName(),
 			newBranch)
 		if err != nil {
-			fmt.Println(err)
+			fmt.Printf("Error creating branch %s: %v\n", branch, err)
 		} else {
-			fmt.Println("create new branch success")
+			fmt.Printf("Create new branch %s success\n", branch)
 		}
 	}
 	return 0
