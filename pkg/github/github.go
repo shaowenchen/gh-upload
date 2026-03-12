@@ -19,8 +19,6 @@ type GithubConfig struct {
 
 var CurrentRepo string = "1"
 
-const RepoMaxSize int = 1024 * 1024 // unit: KB
-
 type GitHubClient struct {
 	client *github.Client
 	config GithubConfig
@@ -128,18 +126,17 @@ func (g *GitHubClient) GetRepoBranchSize(repo *github.Repository, branch string)
 }
 
 func (g *GitHubClient) GetAvaliabelRepo(config GithubConfig) *github.Repository {
-	opt := &github.RepositoryListByOrgOptions{
-		Sort:      "created",
-		Direction: "desc",
-	}
-	repos, _, err := g.client.Repositories.ListByOrg(context.TODO(), config.DataGroup, opt)
+	const repoName = "cdn0"
+	repos, _, err := g.client.Repositories.ListByOrg(context.TODO(), config.DataGroup, nil)
 	if err != nil {
 		fmt.Println(err)
 	}
-	if len(repos) > 0 && g.GetRepoBranchSize(repos[0], config.DataBranch) < RepoMaxSize {
-		return repos[0]
+	for _, r := range repos {
+		if r.GetName() == repoName {
+			return r
+		}
 	}
-	return g.createRepo(fmt.Sprintf("cdn%d", len(repos)), config.DataBranch)
+	return g.createRepo(repoName, config.DataBranch)
 }
 
 func (g *GitHubClient) GetRepoFileList(repo *github.Repository) []*github.RepositoryContent {
