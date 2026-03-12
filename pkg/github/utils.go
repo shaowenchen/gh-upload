@@ -25,6 +25,6 @@ func readFile(filepath string) []byte {
 		fmt.Println(err)
 		return nil
 	}
-	os.Remove(filepath)
+	// 临时文件由调用方（server）在 defer 中统一删除，避免重复删除
 	return content
 }

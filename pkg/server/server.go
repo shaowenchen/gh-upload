@@ -3,9 +3,11 @@ package server
 import (
 	"fmt"
 	"net/http"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/shaowenchen/gh-upload/pkg/github"
@@ -17,13 +19,16 @@ func PostFiles(c *gin.Context) {
 		c.String(http.StatusBadRequest, fmt.Sprintf("get form err: %s", err.Error()))
 		return
 	}
-	basePath := "./"
-	filename := basePath + filepath.Base(file.Filename)
-	if err := c.SaveUploadedFile(file, filename); err != nil {
+	// GitHub API 需要完整文件内容（base64），不支持流式上传，先暂存到本地临时文件
+	tempDir := os.TempDir()
+	tempPath := filepath.Join(tempDir, fmt.Sprintf("gh-upload-%d-%s", time.Now().UnixNano(), filepath.Base(file.Filename)))
+	defer os.Remove(tempPath) // 上传完成后删除临时文件（成功或失败都清理）
+
+	if err := c.SaveUploadedFile(file, tempPath); err != nil {
 		c.String(http.StatusBadRequest, fmt.Sprintf("upload file err: %s", err.Error()))
 		return
 	}
-	download_url := github.NewGithubClient(GlobalConfig.Github).SaveToRepo(GlobalConfig.Github, filename, nil)
+	download_url := github.NewGithubClient(GlobalConfig.Github).SaveToRepo(GlobalConfig.Github, tempPath, nil)
 	if download_url == "" {
 		ShowError(c, "upload file err")
 		return
