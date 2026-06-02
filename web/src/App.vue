@@ -4,7 +4,7 @@
     <div class="script-header">
       <div>
         <h3>CLI Upload</h3>
-        <p>Use this script to upload from terminal. Large files are split by the server automatically.</p>
+        <p>Compress the current directory first, then upload the archive. Large files are split by the server automatically.</p>
       </div>
       <button @click="copyUploadScript" class="copy-script-btn">Copy Script</button>
     </div>
@@ -71,11 +71,18 @@ export default {
 set -euo pipefail
 
 if [ "$#" -lt 1 ]; then
-  echo "Usage: gh-upload <file>"
+  echo "Usage: gh-upload-dir [dir]"
   exit 1
 fi
 
-curl -sS -F "file=@$1" "${this.apiBaseURL}/api/v1/files"`;
+TARGET_DIR="${1:-.}"
+DIR_NAME="$(basename "$(cd "$TARGET_DIR" && pwd)")"
+ARCHIVE_NAME="${DIR_NAME}-$(date +%Y%m%d%H%M%S).tar.gz"
+TMP_ARCHIVE="/tmp/${ARCHIVE_NAME}"
+
+tar -czf "$TMP_ARCHIVE" -C "$TARGET_DIR" .
+curl -sS -F "file=@${TMP_ARCHIVE}" "${this.apiBaseURL}/api/v1/files"
+rm -f "$TMP_ARCHIVE"`;
     },
   },
   methods: {
