@@ -54,3 +54,8 @@ type PostFilesResponse struct {
 type GetFilesResponse struct {
 	List []RespFile `json:"list"`
 }
+
+type ConfigResponse struct {
+	APIBaseURL string `json:"api_base_url"`
+	UploadURL  string `json:"upload_url"`
+}

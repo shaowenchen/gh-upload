@@ -52,6 +52,7 @@ func setupRouter() *gin.Engine {
 	r.GET("/api/v1/files", server.GetFiles)
 	r.GET("/api/v1/files/:id/download", server.DownloadFile)
 	r.GET("/api/v1/clear", server.ClearFiles)
+	r.GET("/api/v1/config", server.GetConfig)
 	r.GET("/api/version/", server.Version)
 
 	apiPrefix := "/uploadbases"

@@ -46,7 +46,7 @@
       <div class="example-btn">
         <file-upload
           class="btn btn-primary"
-          post-action="https://gh-uploadapi.chenshaowen.com/api/v1/files"
+          :post-action="uploadURL"
           :multiple="true"
           :drop="true"
           :drop-directory="true"
@@ -152,6 +152,12 @@ export default {
   name: "DragUpload",
   components: {
     FileUpload,
+  },
+  props: {
+    uploadURL: {
+      type: String,
+      required: true,
+    },
   },
   data() {
     return {

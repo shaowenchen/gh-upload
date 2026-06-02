@@ -1,5 +1,5 @@
 <template>
-  <DragUpload />
+  <DragUpload :uploadURL="uploadURL" />
   <div class="script-container">
     <div class="script-header">
       <div>
@@ -49,7 +49,8 @@ export default {
     return {
       filelist: [],
       tableVisible: false,
-      apiBaseURL: "https://gh-uploadapi.chenshaowen.com",
+      apiBaseURL: window.location.origin,
+      uploadURL: window.location.origin + "/api/v1/files",
     };
   },
   components: {
@@ -60,7 +61,8 @@ export default {
       this.tableVisible = this.filelist.length > 0;
     },
   },
-  created: function () {
+  created: async function () {
+    await this.loadConfig();
     this.updateFileList();
   },
   computed: {
@@ -93,6 +95,19 @@ curl -sS -F "file=@$1" "${this.apiBaseURL}/api/v1/files"`;
       this.filelist = [];
       axios.get(this.apiBaseURL + "/api/v1/files").then((response) => {
         this.filelist = response.data.data.list;
+      });
+    },
+    loadConfig: function () {
+      return axios.get("/api/v1/config").then((response) => {
+        const config = response.data.data;
+        if (config.api_base_url) {
+          this.apiBaseURL = config.api_base_url;
+        }
+        if (config.upload_url) {
+          this.uploadURL = config.upload_url;
+        }
+      }).catch(error => {
+        console.error("Error loading config:", error);
       });
     },
     clearFiles: function () {

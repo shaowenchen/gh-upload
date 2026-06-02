@@ -216,6 +216,14 @@ func Version(c *gin.Context) {
 	})
 }
 
+func GetConfig(c *gin.Context) {
+	apiBaseURL := buildConfiguredAPIBaseURL(c)
+	ShowData(c, ConfigResponse{
+		APIBaseURL: apiBaseURL,
+		UploadURL:  fmt.Sprintf("%s/api/v1/files", apiBaseURL),
+	})
+}
+
 func saveLargeFile(client *github.GitHubClient, filePath string, originalName string, contentType string, size int64) (*ChunkManifest, error) {
 	file, err := os.Open(filePath)
 	if err != nil {
@@ -339,4 +347,11 @@ func buildConfiguredRawURL(downloadURL string) string {
 		return strings.ReplaceAll(downloadURL, "raw.githubusercontent.com", GlobalConfig.Server.DownloadURLS[0])
 	}
 	return fmt.Sprintf("https://%s/%s", GlobalConfig.Server.DownloadURLS[0], downloadURL)
+}
+
+func buildConfiguredAPIBaseURL(c *gin.Context) string {
+	if len(GlobalConfig.Server.DownloadURLS) > 0 && GlobalConfig.Server.DownloadURLS[0] != "" {
+		return fmt.Sprintf("https://%s", GlobalConfig.Server.DownloadURLS[0])
+	}
+	return buildPublicURL(c, "")
 }
