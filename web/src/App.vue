@@ -1,5 +1,15 @@
 <template>
   <DragUpload />
+  <div class="script-container">
+    <div class="script-header">
+      <div>
+        <h3>CLI Upload</h3>
+        <p>Use this script to upload from terminal. Large files are split by the server automatically.</p>
+      </div>
+      <button @click="copyUploadScript" class="copy-script-btn">Copy Script</button>
+    </div>
+    <pre class="script-block"><code>{{ uploadScript }}</code></pre>
+  </div>
   <div class="table-container" v-show="tableVisible">
     <table>
       <thead>
@@ -39,6 +49,7 @@ export default {
     return {
       filelist: [],
       tableVisible: false,
+      apiBaseURL: "https://gh-uploadapi.chenshaowen.com",
     };
   },
   components: {
@@ -51,6 +62,19 @@ export default {
   },
   created: function () {
     this.updateFileList();
+  },
+  computed: {
+    uploadScript: function () {
+      return `#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 1 ]; then
+  echo "Usage: gh-upload <file>"
+  exit 1
+fi
+
+curl -sS -F "file=@$1" "${this.apiBaseURL}/api/v1/files"`;
+    },
   },
   methods: {
     humansize: function (size) {
@@ -67,18 +91,25 @@ export default {
     },
     updateFileList: function () {
       this.filelist = [];
-      axios.get("https://gh-uploadapi.chenshaowen.com/api/v1/files").then((response) => {
+      axios.get(this.apiBaseURL + "/api/v1/files").then((response) => {
         this.filelist = response.data.data.list;
       });
     },
     clearFiles: function () {
-      axios.get("https://gh-uploadapi.chenshaowen.com/api/v1/clear").then(() => {
+      axios.get(this.apiBaseURL + "/api/v1/clear").then(() => {
         this.updateFileList();
       }).catch(error => {
         console.error("Error clearing files:", error);
         alert("Failed to clear files");
       });
-    }
+    },
+    copyUploadScript: function () {
+      navigator.clipboard.writeText(this.uploadScript).then(() => {
+        alert("Upload script copied");
+      }).catch(() => {
+        alert("Failed to copy upload script");
+      });
+    },
   },
 };
 </script>
@@ -98,6 +129,48 @@ export default {
   margin-left: auto;
   margin-right: auto;
   margin-top: 20px;
+}
+.script-container {
+  max-width: 720px;
+  width: calc(100% - 32px);
+  margin: 24px auto;
+  padding: 18px;
+  text-align: left;
+  background: #111827;
+  border-radius: 12px;
+  box-shadow: 0 14px 40px rgba(17, 24, 39, 0.18);
+  color: #e5e7eb;
+}
+.script-header {
+  display: flex;
+  justify-content: space-between;
+  gap: 16px;
+  align-items: flex-start;
+}
+.script-header h3 {
+  margin: 0 0 6px;
+  color: #ffffff;
+}
+.script-header p {
+  margin: 0 0 14px;
+  color: #9ca3af;
+}
+.copy-script-btn {
+  padding: 8px 12px;
+  border: 0;
+  border-radius: 8px;
+  background: #10b981;
+  color: #ffffff;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.script-block {
+  margin: 0;
+  padding: 14px;
+  overflow-x: auto;
+  background: #030712;
+  border-radius: 8px;
+  color: #d1fae5;
 }
 .table-container table {
   border-collapse: collapse;
@@ -129,5 +202,14 @@ export default {
 }
 .table-container table tbody tr:nth-child(odd) {
   background-color: #ffffff;
+}
+@media (max-width: 640px) {
+  .script-header {
+    display: block;
+  }
+
+  .copy-script-btn {
+    margin-bottom: 12px;
+  }
 }
 </style>

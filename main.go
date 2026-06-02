@@ -50,6 +50,7 @@ func setupRouter() *gin.Engine {
 	r.Use(allowCrossDomainMiddleware)
 	r.POST("/api/v1/files", server.PostFiles)
 	r.GET("/api/v1/files", server.GetFiles)
+	r.GET("/api/v1/files/:id/download", server.DownloadFile)
 	r.GET("/api/v1/clear", server.ClearFiles)
 	r.GET("/api/version/", server.Version)
 

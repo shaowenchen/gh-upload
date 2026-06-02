@@ -3,7 +3,9 @@ package github
 import (
 	"context"
 	"fmt"
+	"io"
 	"log"
+	"path/filepath"
 
 	"github.com/google/go-github/v43/github"
 	"golang.org/x/oauth2"
@@ -157,11 +159,20 @@ func (g *GitHubClient) GetRepoFileList(repo *github.Repository) []*github.Reposi
 }
 
 func (g *GitHubClient) SaveToRepo(config GithubConfig, filepath string, repo *github.Repository) string {
-	ctx := context.Background()
 	_, newname := genetateFilename(filepath)
+	return g.SaveFileToRepo(config, filepath, newname)
+}
+
+func (g *GitHubClient) SaveFileToRepo(config GithubConfig, filePath string, repoPath string) string {
+	return g.SaveContentToRepo(config, repoPath, readFile(filePath))
+}
+
+func (g *GitHubClient) SaveContentToRepo(config GithubConfig, repoPath string, content []byte) string {
+	ctx := context.Background()
+	repoPath = filepath.ToSlash(repoPath)
 	opts := &github.RepositoryContentFileOptions{
 		Message: github.String(g.config.CommitName),
-		Content: readFile(filepath),
+		Content: content,
 		Branch:  github.String(g.config.DataBranch),
 		Committer: &github.CommitAuthor{
 			Name:  github.String(g.config.CommitName),
@@ -174,13 +185,37 @@ func (g *GitHubClient) SaveToRepo(config GithubConfig, filepath string, repo *gi
 		ctx,
 		g.config.DataGroup,
 		latestRepo.GetName(),
-		newname,
+		repoPath,
 		opts)
 	if err != nil {
 		fmt.Println(err)
 		return ""
 	}
-	return fmt.Sprintf("%s/%s/%s/%s", g.config.DataGroup, latestRepo.GetName(), g.config.DataBranch, newname)
+	return fmt.Sprintf("%s/%s/%s/%s", g.config.DataGroup, latestRepo.GetName(), g.config.DataBranch, repoPath)
+}
+
+func (g *GitHubClient) GetRepoFileBytes(repo *github.Repository, fileName string) ([]byte, error) {
+	ctx := context.Background()
+	reader, resp, err := g.client.Repositories.DownloadContents(
+		ctx,
+		g.config.DataGroup,
+		repo.GetName(),
+		fileName,
+		&github.RepositoryContentGetOptions{
+			Ref: g.config.DataBranch,
+		})
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	if resp != nil && resp.Response != nil && resp.StatusCode >= 300 {
+		return nil, fmt.Errorf("download %s failed with status %d", fileName, resp.StatusCode)
+	}
+	content, err := io.ReadAll(reader)
+	if err != nil {
+		return nil, err
+	}
+	return content, nil
 }
 
 func (g *GitHubClient) DeleteFile(repo *github.Repository, fileName string) error {

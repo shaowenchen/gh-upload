@@ -47,10 +47,10 @@ func ShowData(c *gin.Context, data interface{}) {
 	})
 }
 
-type PostFilesResponse struct{
+type PostFilesResponse struct {
 	DownloadURL string `json:"download_url"`
 }
 
-type GetFilesResponse struct{
+type GetFilesResponse struct {
 	List []RespFile `json:"list"`
 }
