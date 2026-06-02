@@ -1,0 +1,341 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Upload</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      font-family: Avenir, Helvetica, Arial, sans-serif;
+      -webkit-font-smoothing: antialiased;
+      -moz-osx-font-smoothing: grayscale;
+      color: #2c3e50;
+      background: #f5f5f5;
+    }
+    .container { max-width: 720px; width: calc(100% - 32px); margin: 40px auto; }
+
+    /* Upload Zone */
+    .upload-zone {
+      position: relative;
+      border: 2px dashed #ccc;
+      border-radius: 12px;
+      padding: 40px 20px;
+      text-align: center;
+      background: #fff;
+      transition: border-color 0.2s, background 0.2s;
+      cursor: pointer;
+    }
+    .upload-zone.drag-over { border-color: #0d6ffd; background: #f0f7ff; }
+    .upload-zone-icon { font-size: 48px; margin-bottom: 12px; }
+    .upload-zone-text { color: #666; font-size: 14px; }
+    .upload-zone-input { display: none; }
+
+    /* File Queue */
+    .file-queue { margin-top: 16px; }
+    .file-queue-item {
+      display: flex; align-items: center; justify-content: space-between;
+      padding: 10px 14px; background: #fff; border-radius: 8px;
+      margin-bottom: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
+    }
+    .file-queue-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
+    .file-queue-item .size { margin: 0 12px; font-size: 12px; color: #888; white-space: nowrap; }
+    .file-queue-item .status { font-size: 12px; white-space: nowrap; }
+    .file-queue-item .status.success { color: #10b981; }
+    .file-queue-item .status.error { color: #ef4444; }
+    .file-queue-item .status.uploading { color: #0d6ffd; }
+    .file-queue-item .copy-btn {
+      margin-left: 8px; padding: 2px 8px; font-size: 12px; border: 1px solid #ddd;
+      border-radius: 4px; background: #fff; cursor: pointer;
+    }
+
+    .upload-actions { display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end; }
+    .upload-actions button {
+      padding: 8px 20px; border: none; border-radius: 6px;
+      font-size: 14px; cursor: pointer; color: #fff;
+    }
+    .btn-upload { background: #0d6ffd; }
+    .btn-clear { background: #808080; }
+
+    /* Script Container */
+    .script-container {
+      margin: 24px 0; padding: 18px; text-align: left;
+      background: #111827; border-radius: 12px;
+      box-shadow: 0 14px 40px rgba(17, 24, 39, 0.18); color: #e5e7eb;
+    }
+    .script-header { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
+    .script-header h3 { margin: 0 0 6px; color: #fff; }
+    .script-header p { margin: 0 0 14px; color: #9ca3af; font-size: 13px; }
+    .copy-script-btn {
+      padding: 8px 12px; border: 0; border-radius: 8px;
+      background: #10b981; color: #fff; cursor: pointer; white-space: nowrap; font-size: 13px;
+    }
+    .script-block {
+      margin: 0; padding: 14px; overflow-x: auto;
+      background: #030712; border-radius: 8px; color: #d1fae5; font-size: 13px;
+    }
+
+    /* File Table */
+    .table-container { margin-top: 20px; }
+    .table-container h3 { margin-bottom: 12px; font-size: 16px; }
+    .table-container table { width: 100%; border-collapse: collapse; font-family: Tahoma, Geneva, sans-serif; }
+    .table-container table td { padding: 12px 15px; max-width: 400px; overflow: hidden; text-align: center; }
+    .table-container table thead td {
+      background: #0d6ffd; color: #fff; font-weight: bold; font-size: 13px; border: 1px solid #54585d;
+    }
+    .table-container table tbody td {
+      color: #636363; border: 1px solid #dddfe1;
+      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    }
+    .table-container table tbody tr { background: #f9fafb; }
+    .table-container table tbody tr:nth-child(odd) { background: #fff; }
+    .table-container table tbody a { color: #0d6ffd; text-decoration: none; }
+    .table-footer { margin-top: 16px; text-align: right; }
+    .table-footer button {
+      padding: 8px 16px; background: #808080; color: #fff;
+      border: none; border-radius: 4px; cursor: pointer; font-size: 14px;
+    }
+
+    @media (max-width: 640px) {
+      .script-header { display: block; }
+      .copy-script-btn { margin-bottom: 12px; }
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <!-- Upload Zone -->
+    <div class="upload-zone" id="dropZone">
+      <div class="upload-zone-icon">&#128194;</div>
+      <div class="upload-zone-text">Drag & drop files here, or click to select</div>
+      <input type="file" class="upload-zone-input" id="fileInput" multiple>
+    </div>
+
+    <div class="file-queue" id="fileQueue"></div>
+    <div class="upload-actions" id="uploadActions" style="display:none">
+      <button class="btn-clear" id="btnClearQueue">Clear Queue</button>
+      <button class="btn-upload" id="btnUpload">Upload All</button>
+    </div>
+
+    <!-- CLI Script -->
+    <div class="script-container">
+      <div class="script-header">
+        <div>
+          <h3>CLI Upload</h3>
+          <p>Compress the current directory first, then upload the archive. Large files are split by the server automatically.</p>
+        </div>
+        <button class="copy-script-btn" id="btnCopyScript">Copy Script</button>
+      </div>
+      <pre class="script-block"><code id="uploadScript"></code></pre>
+    </div>
+
+    <!-- File Table -->
+    <div class="table-container" id="tableContainer" style="display:none">
+      <h3>Uploaded Files</h3>
+      <table>
+        <thead><tr><td>File</td><td>Size</td><td>Link</td></tr></thead>
+        <tbody id="fileTableBody"></tbody>
+      </table>
+      <div class="table-footer">
+        <button id="btnClearRepo">Clear All</button>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    let apiBaseURL = window.location.origin;
+    let uploadURL = apiBaseURL + "/api/v1/files";
+    let selectedFiles = [];
+
+    // ---- Helpers ----
+    function humanSize(bytes) {
+      if (bytes == null) return "-";
+      if (bytes > 1099511627776) return (bytes / 1099511627776).toFixed(2) + " TB";
+      if (bytes > 1073741824) return (bytes / 1073741824).toFixed(2) + " GB";
+      if (bytes > 1048576) return (bytes / 1048576).toFixed(2) + " MB";
+      if (bytes > 1024) return (bytes / 1024).toFixed(2) + " KB";
+      return bytes + " B";
+    }
+
+    async function loadConfig() {
+      try {
+        const res = await fetch("/api/v1/config");
+        const json = await res.json();
+        if (json.data && json.data.api_base_url) {
+          apiBaseURL = json.data.api_base_url;
+        }
+        if (json.data && json.data.upload_url) {
+          uploadURL = json.data.upload_url;
+        }
+        updateScript();
+      } catch (e) {
+        console.error("Error loading config:", e);
+      }
+    }
+
+    function updateScript() {
+      const script = `#!/usr/bin/env bash
+set -euo pipefail
+
+if [ "$#" -lt 1 ]; then
+  echo "Usage: gh-upload-dir [dir]"
+  exit 1
+fi
+
+TARGET_DIR="${1:-.}"
+DIR_NAME="$(basename "$(cd "$TARGET_DIR" && pwd)")"
+ARCHIVE_NAME="${DIR_NAME}-$(date +%Y%m%d%H%M%S).tar.gz"
+TMP_ARCHIVE="/tmp/${ARCHIVE_NAME}"
+
+tar -czf "$TMP_ARCHIVE" -C "$TARGET_DIR" .
+curl -sS -F "file=@${TMP_ARCHIVE}" "${apiBaseURL}/api/v1/files"
+rm -f "$TMP_ARCHIVE"`;
+      document.getElementById("uploadScript").textContent = script;
+    }
+
+    async function loadFileList() {
+      try {
+        const res = await fetch(apiBaseURL + "/api/v1/files");
+        const json = await res.json();
+        const list = json.data && json.data.list ? json.data.list : [];
+        renderFileTable(list);
+      } catch (e) {
+        console.error("Error loading files:", e);
+      }
+    }
+
+    function renderFileTable(list) {
+      const container = document.getElementById("tableContainer");
+      const tbody = document.getElementById("fileTableBody");
+      if (list.length === 0) {
+        container.style.display = "none";
+        return;
+      }
+      container.style.display = "block";
+      tbody.innerHTML = list.map(function(f) {
+        return '<tr><td>' + escapeHtml(f.name || "") + '</td><td>' + humanSize(f.size) +
+               '</td><td><a href="' + escapeAttr(f.download_url) + '" target="_blank">Open</a></td></tr>';
+      }).join("");
+    }
+
+    function escapeHtml(s) {
+      var d = document.createElement("div");
+      d.textContent = s;
+      return d.innerHTML;
+    }
+
+    function escapeAttr(s) {
+      return s.replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    }
+
+    // ---- File Queue UI ----
+    var dropZone = document.getElementById("dropZone");
+    var fileInput = document.getElementById("fileInput");
+    var fileQueue = document.getElementById("fileQueue");
+    var uploadActions = document.getElementById("uploadActions");
+    var btnClearQueue = document.getElementById("btnClearQueue");
+    var btnUpload = document.getElementById("btnUpload");
+
+    dropZone.addEventListener("click", function() { fileInput.click(); });
+    dropZone.addEventListener("dragover", function(e) { e.preventDefault(); dropZone.classList.add("drag-over"); });
+    dropZone.addEventListener("dragleave", function() { dropZone.classList.remove("drag-over"); });
+    dropZone.addEventListener("drop", function(e) {
+      e.preventDefault();
+      dropZone.classList.remove("drag-over");
+      addFiles(e.dataTransfer.files);
+    });
+    fileInput.addEventListener("change", function() { addFiles(fileInput.files); fileInput.value = ""; });
+
+    function addFiles(fileList) {
+      for (var i = 0; i < fileList.length; i++) {
+        selectedFiles.push({ file: fileList[i], status: "pending", url: null });
+      }
+      renderQueue();
+    }
+
+    function renderQueue() {
+      fileQueue.innerHTML = selectedFiles.map(function(entry, idx) {
+        var statusClass = entry.status === "error" ? "error" : entry.status === "uploading" ? "uploading" : "success";
+        var statusText = entry.status === "pending" ? "Waiting" : entry.status === "uploading" ? "Uploading..." :
+                         entry.status === "error" ? "Failed" : "Done";
+        var copyBtn = entry.url ? '<button class="copy-btn" data-idx="' + idx + '">Copy</button>' : "";
+        return '<div class="file-queue-item"><span class="name">' + escapeHtml(entry.file.name) +
+               '</span><span class="size">' + humanSize(entry.file.size) +
+               '</span><span class="status ' + statusClass + '">' + statusText + '</span>' + copyBtn + '</div>';
+      }).join("");
+
+      uploadActions.style.display = selectedFiles.length > 0 ? "flex" : "none";
+
+      document.querySelectorAll(".file-queue-item .copy-btn").forEach(function(btn) {
+        btn.addEventListener("click", function() {
+          var idx = parseInt(this.dataset.idx);
+          if (selectedFiles[idx] && selectedFiles[idx].url) {
+            navigator.clipboard.writeText(selectedFiles[idx].url).then(function() {
+              alert("URL copied");
+            }).catch(function() {
+              prompt("URL:", selectedFiles[idx].url);
+            });
+          }
+        });
+      });
+    }
+
+    btnClearQueue.addEventListener("click", function() {
+      selectedFiles = [];
+      renderQueue();
+    });
+
+    btnUpload.addEventListener("click", async function() {
+      var pending = selectedFiles.filter(function(e) { return e.status === "pending" || e.status === "error"; });
+      if (pending.length === 0) return;
+
+      for (var entry of pending) {
+        entry.status = "uploading";
+        renderQueue();
+
+        var formData = new FormData();
+        formData.append("file", entry.file);
+
+        try {
+          var res = await fetch(uploadURL, { method: "POST", body: formData });
+          var json = await res.json();
+          if (json.code === 0 && json.data && json.data.download_url) {
+            entry.status = "success";
+            entry.url = json.data.download_url;
+          } else {
+            entry.status = "error";
+          }
+        } catch (e) {
+          entry.status = "error";
+        }
+        renderQueue();
+      }
+      loadFileList();
+    });
+
+    // ---- Script copy ----
+    document.getElementById("btnCopyScript").addEventListener("click", function() {
+      var script = document.getElementById("uploadScript").textContent;
+      navigator.clipboard.writeText(script).then(function() {
+        alert("Upload script copied");
+      }).catch(function() {
+        prompt("Copy the script below:", script);
+      });
+    });
+
+    // ---- Clear repo ----
+    document.getElementById("btnClearRepo").addEventListener("click", async function() {
+      try {
+        await fetch(apiBaseURL + "/api/v1/clear");
+        loadFileList();
+      } catch (e) {
+        console.error("Error clearing:", e);
+        alert("Failed to clear files");
+      }
+    });
+
+    // ---- Init ----
+    loadConfig().then(loadFileList);
+  </script>
+</body>
+</html>

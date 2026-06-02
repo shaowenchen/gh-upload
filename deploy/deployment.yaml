@@ -1,0 +1,60 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: gh-upload
+  namespace: ops-system
+  labels:
+    app: gh-upload
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: gh-upload
+  template:
+    metadata:
+      labels:
+        app: gh-upload
+    spec:
+      containers:
+        - name: gh-upload
+          image: docker.io/shaowenchen/gh-upload:latest
+          imagePullPolicy: Always
+          ports:
+            - name: http
+              containerPort: 8080
+          env:
+            - name: PORT
+              value: "8080"
+            - name: HOST
+              value: "0.0.0.0"
+            - name: GITHUB_TOKEN
+              value: ""
+            - name: GITHUB_OWNER
+              value: "uploadbases"
+            - name: GITHUB_BRANCH
+              value: "raw"
+            - name: GITHUB_COMMIT_EMAIL
+              value: "auto@auto.com"
+            - name: GITHUB_COMMIT_NAME
+              value: "none"
+            - name: DOWNLOAD_URLS
+              value: ""
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+          resources:
+            requests:
+              cpu: 500m
+              memory: 256Mi
+            limits:
+              cpu: 1000m
+              memory: 1024Mi

@@ -1,9 +1,24 @@
-FROM hubimage/builder-golang:1.19 AS builder
-COPY . .
-RUN make build
+FROM node:22-alpine AS builder
+WORKDIR /app
 
-FROM hubimage/runtime-ubuntu:22.04
-COPY --from=builder /builder/bin/app .
-COPY --from=builder /builder/default.toml .
-CMD [ "./app", "-c", "./default.toml"]
-EXPOSE 80
+COPY package.json package-lock.json ./
+RUN npm ci
+
+COPY tsconfig.json ./
+COPY src ./src
+
+RUN npm run build
+RUN test -f dist/public/index.html
+
+FROM node:22-alpine AS runner
+WORKDIR /app
+
+COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/src/public ./dist/public
+COPY --from=builder /app/node_modules ./node_modules
+COPY package.json ./
+
+RUN test -f dist/public/index.html
+
+EXPOSE 8080
+CMD ["node", "dist/index.js"]

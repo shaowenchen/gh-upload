@@ -1,6 +1,0 @@
-[gin]
-runmode = "debug"
-[server]
-download_urls = ""
-[github]
-token = ""
