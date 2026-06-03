@@ -3,7 +3,6 @@ export interface Config {
   host: string;
   github: {
     token: string;
-    owner: string;
     repo: string;
     branch: string;
     commitEmail: string;
@@ -18,8 +17,7 @@ function loadConfig(): Config {
     host: process.env.HOST || "0.0.0.0",
     github: {
       token: process.env.GITHUB_TOKEN || "",
-      owner: process.env.GITHUB_OWNER || "uploadbases",
-      repo: process.env.GITHUB_REPO || "cdn0",
+      repo: process.env.GITHUB_REPO || "uploadbases/cdn0",
       branch: process.env.GITHUB_BRANCH || "raw",
       commitEmail: process.env.GITHUB_COMMIT_EMAIL || "auto@auto.com",
       commitName: process.env.GITHUB_COMMIT_NAME || "none",

@@ -29,10 +29,8 @@ spec:
               value: "0.0.0.0"
             - name: GITHUB_TOKEN
               value: ""
-            - name: GITHUB_OWNER
-              value: "uploadbases"
             - name: GITHUB_REPO
-              value: "cdn0"
+              value: "uploadbases/cdn0"
             - name: GITHUB_BRANCH
               value: "raw"
             - name: GITHUB_COMMIT_EMAIL
