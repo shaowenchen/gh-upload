@@ -12,10 +12,13 @@
       font-family: Avenir, Helvetica, Arial, sans-serif;
       -webkit-font-smoothing: antialiased;
       -moz-osx-font-smoothing: grayscale;
-      color: #2c3e50;
-      background: #f5f5f5;
+      color: #172033;
+      background:
+        radial-gradient(circle at top left, rgba(16, 185, 129, 0.14), transparent 30%),
+        linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%);
+      min-height: 100vh;
     }
-    .container { max-width: 720px; width: calc(100% - 32px); margin: 40px auto; }
+    .container { max-width: 840px; width: calc(100% - 32px); margin: 36px auto 56px; }
 
     /* Brand */
     .brand {
@@ -32,22 +35,28 @@
     /* Upload Zone */
     .upload-zone {
       position: relative;
-      border: 2px dashed #ccc;
-      border-radius: 12px;
-      padding: 40px 20px;
+      border: 1.5px dashed #c8d3df;
+      border-radius: 24px;
+      padding: 46px 20px;
       text-align: center;
-      background: #fff;
-      transition: border-color 0.2s, background 0.2s;
+      background: rgba(255, 255, 255, 0.86);
+      box-shadow: 0 18px 45px rgba(15, 23, 42, 0.08);
+      transition: border-color 0.2s, background 0.2s, box-shadow 0.2s, transform 0.2s;
       cursor: pointer;
     }
-    .upload-zone.drag-over { border-color: #0d6ffd; background: #f0f7ff; }
+    .upload-zone.drag-over {
+      border-color: #10b981;
+      background: #ecfdf5;
+      box-shadow: 0 22px 55px rgba(16, 185, 129, 0.18);
+      transform: translateY(-1px);
+    }
     .upload-zone-icon {
       width: 56px;
       height: 56px;
       margin-bottom: 12px;
       filter: drop-shadow(0 8px 14px rgba(15, 118, 110, 0.16));
     }
-    .upload-zone-text { color: #666; font-size: 14px; }
+    .upload-zone-text { color: #64748b; font-size: 15px; }
     .upload-zone-input { display: none; }
 
     /* File Queue */
@@ -73,18 +82,44 @@
       padding: 8px 20px; border: none; border-radius: 6px;
       font-size: 14px; cursor: pointer; color: #fff;
     }
-    .btn-upload { background: #0d6ffd; }
-    .btn-clear { background: #808080; }
+    .btn-upload { background: #0f766e; }
+    .btn-clear { background: #64748b; }
 
     /* Script Container */
     .script-container {
-      margin: 24px 0; padding: 18px; text-align: left;
-      background: #111827; border-radius: 12px;
-      box-shadow: 0 14px 40px rgba(17, 24, 39, 0.18); color: #e5e7eb;
+      margin: 22px 0; padding: 0; text-align: left;
+      background: #111827; border-radius: 22px;
+      box-shadow: 0 18px 42px rgba(17, 24, 39, 0.18); color: #e5e7eb;
+      overflow: hidden;
     }
-    .script-header { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; }
-    .script-header h3 { margin: 0 0 6px; color: #fff; }
-    .script-header p { margin: 0 0 14px; color: #9ca3af; font-size: 13px; }
+    .script-summary {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      align-items: center;
+      padding: 18px 20px;
+      cursor: pointer;
+      list-style: none;
+    }
+    .script-summary::-webkit-details-marker { display: none; }
+    .script-summary::after {
+      content: "Show";
+      padding: 7px 11px;
+      border-radius: 999px;
+      background: rgba(255, 255, 255, 0.09);
+      color: #a7f3d0;
+      font-size: 12px;
+      font-weight: 700;
+    }
+    .script-container[open] .script-summary::after { content: "Hide"; }
+    .script-content { padding: 0 20px 20px; }
+    .script-title h3 { margin: 0 0 6px; color: #fff; }
+    .script-title p { margin: 0; color: #9ca3af; font-size: 13px; line-height: 1.5; }
+    .script-toolbar {
+      display: flex;
+      justify-content: flex-end;
+      margin-bottom: 10px;
+    }
     .copy-script-btn {
       padding: 8px 12px; border: 0; border-radius: 8px;
       background: #10b981; color: #fff; cursor: pointer; white-space: nowrap; font-size: 13px;
@@ -94,30 +129,95 @@
       background: #030712; border-radius: 8px; color: #d1fae5; font-size: 13px;
     }
 
-    /* File Table */
-    .table-container { margin-top: 20px; }
-    .table-container h3 { margin-bottom: 12px; font-size: 16px; }
-    .table-container table { width: 100%; border-collapse: collapse; font-family: Tahoma, Geneva, sans-serif; }
-    .table-container table td { padding: 12px 15px; max-width: 400px; overflow: hidden; text-align: center; }
-    .table-container table thead td {
-      background: #0d6ffd; color: #fff; font-weight: bold; font-size: 13px; border: 1px solid #54585d;
+    /* Uploaded Files */
+    .table-container {
+      margin-top: 24px;
+      padding: 22px;
+      background: rgba(255, 255, 255, 0.86);
+      border: 1px solid rgba(148, 163, 184, 0.24);
+      border-radius: 22px;
+      box-shadow: 0 18px 45px rgba(15, 23, 42, 0.08);
     }
-    .table-container table tbody td {
-      color: #636363; border: 1px solid #dddfe1;
-      white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+    .table-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 16px;
+      margin-bottom: 14px;
     }
-    .table-container table tbody tr { background: #f9fafb; }
-    .table-container table tbody tr:nth-child(odd) { background: #fff; }
-    .table-container table tbody a { color: #0d6ffd; text-decoration: none; }
-    .table-footer { margin-top: 16px; text-align: right; }
+    .table-header h3 { font-size: 18px; color: #172033; }
+    .file-list {
+      display: grid;
+      gap: 10px;
+    }
+    .file-card {
+      display: grid;
+      grid-template-columns: minmax(0, 1fr) auto auto;
+      gap: 14px;
+      align-items: center;
+      padding: 14px;
+      background: #fff;
+      border: 1px solid #e2e8f0;
+      border-radius: 16px;
+      transition: border-color 0.2s, box-shadow 0.2s, transform 0.2s;
+    }
+    .file-card:hover {
+      border-color: #99f6e4;
+      box-shadow: 0 10px 24px rgba(15, 118, 110, 0.1);
+      transform: translateY(-1px);
+    }
+    .file-main {
+      min-width: 0;
+      display: flex;
+      align-items: center;
+      gap: 12px;
+    }
+    .file-icon {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      width: 38px;
+      height: 38px;
+      flex: 0 0 auto;
+      border-radius: 12px;
+      background: #ecfdf5;
+      color: #0f766e;
+      font-weight: 800;
+    }
+    .file-name {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      color: #172033;
+      font-weight: 700;
+    }
+    .file-size {
+      color: #64748b;
+      font-size: 13px;
+      white-space: nowrap;
+    }
+    .file-open {
+      padding: 8px 12px;
+      border-radius: 999px;
+      background: #ecfeff;
+      color: #0f766e;
+      font-size: 13px;
+      font-weight: 700;
+      text-decoration: none;
+      white-space: nowrap;
+    }
     .table-footer button {
-      padding: 8px 16px; background: #808080; color: #fff;
-      border: none; border-radius: 4px; cursor: pointer; font-size: 14px;
+      padding: 8px 14px; background: #f1f5f9; color: #475569;
+      border: 1px solid #dbe4ee; border-radius: 999px; cursor: pointer; font-size: 13px;
     }
 
     @media (max-width: 640px) {
-      .script-header { display: block; }
-      .copy-script-btn { margin-bottom: 12px; }
+      .container { width: calc(100% - 24px); margin-top: 24px; }
+      .script-summary,
+      .table-header { align-items: flex-start; }
+      .file-card { grid-template-columns: minmax(0, 1fr); }
+      .file-size,
+      .file-open { justify-self: start; }
     }
   </style>
 </head>
@@ -141,27 +241,30 @@
     </div>
 
     <!-- CLI Script -->
-    <div class="script-container">
-      <div class="script-header">
-        <div>
+    <details class="script-container">
+      <summary class="script-summary">
+        <div class="script-title">
           <h3>CLI Upload</h3>
           <p>Set the file path, then upload it directly. Large files are split by the server automatically.</p>
         </div>
-        <button class="copy-script-btn" id="btnCopyScript">Copy Script</button>
+      </summary>
+      <div class="script-content">
+        <div class="script-toolbar">
+          <button class="copy-script-btn" id="btnCopyScript">Copy Script</button>
+        </div>
+        <pre class="script-block"><code id="uploadScript"></code></pre>
       </div>
-      <pre class="script-block"><code id="uploadScript"></code></pre>
-    </div>
+    </details>
 
     <!-- File Table -->
     <div class="table-container" id="tableContainer" style="display:none">
-      <h3>Uploaded Files</h3>
-      <table>
-        <thead><tr><td>File</td><td>Size</td><td>Link</td></tr></thead>
-        <tbody id="fileTableBody"></tbody>
-      </table>
-      <div class="table-footer">
-        <button id="btnClearRepo">Clear All</button>
+      <div class="table-header">
+        <h3>Uploaded Files</h3>
+        <div class="table-footer">
+          <button id="btnClearRepo">Clear All</button>
+        </div>
       </div>
+      <div class="file-list" id="fileTableBody"></div>
     </div>
   </div>
 
@@ -225,8 +328,9 @@
       }
       container.style.display = "block";
       tbody.innerHTML = list.map(function(f) {
-        return '<tr><td>' + escapeHtml(f.name || "") + '</td><td>' + humanSize(f.size) +
-               '</td><td><a href="' + escapeAttr(f.download_url) + '" target="_blank">Open</a></td></tr>';
+        return '<div class="file-card"><div class="file-main"><span class="file-icon">&uarr;</span><span class="file-name">' +
+               escapeHtml(f.name || "") + '</span></div><span class="file-size">' + humanSize(f.size) +
+               '</span><a class="file-open" href="' + escapeAttr(f.download_url) + '" target="_blank" rel="noopener">Open</a></div>';
       }).join("");
     }
 
