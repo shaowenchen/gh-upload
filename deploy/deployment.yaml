@@ -31,6 +31,8 @@ spec:
               value: ""
             - name: GITHUB_OWNER
               value: "uploadbases"
+            - name: GITHUB_REPO
+              value: "cdn0"
             - name: GITHUB_BRANCH
               value: "raw"
             - name: GITHUB_COMMIT_EMAIL

@@ -4,6 +4,7 @@ export interface Config {
   github: {
     token: string;
     owner: string;
+    repo: string;
     branch: string;
     commitEmail: string;
     commitName: string;
@@ -18,6 +19,7 @@ function loadConfig(): Config {
     github: {
       token: process.env.GITHUB_TOKEN || "",
       owner: process.env.GITHUB_OWNER || "uploadbases",
+      repo: process.env.GITHUB_REPO || "cdn0",
       branch: process.env.GITHUB_BRANCH || "raw",
       commitEmail: process.env.GITHUB_COMMIT_EMAIL || "auto@auto.com",
       commitName: process.env.GITHUB_COMMIT_NAME || "none",

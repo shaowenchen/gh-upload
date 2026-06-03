@@ -2,7 +2,7 @@ import { Octokit } from "@octokit/rest";
 import { config } from "../config.js";
 import { Buffer } from "node:buffer";
 
-const REPO_NAME = "cdn0";
+const REPO_NAME = config.github.repo;
 
 interface RepoInfo {
   name: string;
