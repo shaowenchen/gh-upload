@@ -14,6 +14,7 @@ export class GitHubService {
   private branch: string;
   private commitEmail: string;
   private commitName: string;
+  private isOrg: boolean | null = null;
 
   constructor() {
     this.octokit = new Octokit({ auth: config.github.token });
@@ -22,27 +23,43 @@ export class GitHubService {
     this.commitName = config.github.commitName;
   }
 
-  async getOrCreateRepo(): Promise<RepoInfo> {
-    const repos = await this.octokit.rest.repos.listForOrg({
-      org: REPO_OWNER,
-      per_page: 100,
-    });
-    for (const r of repos.data) {
-      if (r.name === REPO_NAME) {
-        return { name: r.name, defaultBranch: r.default_branch || this.branch };
-      }
+  private async checkIsOrg(): Promise<boolean> {
+    if (this.isOrg !== null) return this.isOrg;
+    try {
+      await this.octokit.rest.orgs.get({ org: REPO_OWNER });
+      this.isOrg = true;
+    } catch {
+      this.isOrg = false;
     }
-    return this.createRepo();
+    return this.isOrg;
   }
 
-  private async createRepo(): Promise<RepoInfo> {
-    const { data: repo } = await this.octokit.rest.repos.createInOrg({
-      org: REPO_OWNER,
+  async getOrCreateRepo(): Promise<RepoInfo> {
+    const isOrg = await this.checkIsOrg();
+
+    try {
+      const { data: repo } = await this.octokit.rest.repos.get({
+        owner: REPO_OWNER,
+        repo: REPO_NAME,
+      });
+      return { name: repo.name, defaultBranch: repo.default_branch };
+    } catch {
+      return this.createRepo(isOrg);
+    }
+  }
+
+  private async createRepo(isOrg: boolean): Promise<RepoInfo> {
+    const params = {
       name: REPO_NAME,
       private: false,
       auto_init: false,
       default_branch: this.branch,
-    });
+    } as const;
+
+    const { data: repo } = isOrg
+      ? await this.octokit.rest.repos.createInOrg({ ...params, org: REPO_OWNER })
+      : await this.octokit.rest.repos.createForAuthenticatedUser(params);
+
     return { name: repo.name, defaultBranch: repo.default_branch };
   }
 
