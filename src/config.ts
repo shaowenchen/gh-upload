@@ -13,7 +13,7 @@ export interface Config {
 
 function loadConfig(): Config {
   return {
-    port: parseInt(process.env.PORT || "8080", 10),
+    port: parseInt(process.env.PORT || "3000", 10),
     host: process.env.HOST || "0.0.0.0",
     github: {
       token: process.env.GITHUB_TOKEN || "",

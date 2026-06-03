@@ -21,10 +21,10 @@ spec:
           imagePullPolicy: Always
           ports:
             - name: http
-              containerPort: 8080
+              containerPort: 3000
           env:
             - name: PORT
-              value: "8080"
+              value: "3000"
             - name: HOST
               value: "0.0.0.0"
             - name: GITHUB_TOKEN
