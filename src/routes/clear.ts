@@ -1,8 +1,11 @@
 import { Router } from "express";
 import { GitHubService } from "../services/github.js";
 import { showData, showError } from "../utils/response.js";
+import { adminAuth } from "../middleware/adminAuth.js";
 
 export const clearRouter = Router();
+
+clearRouter.use(adminAuth);
 
 clearRouter.get("/", async (_req, res) => {
   const github = new GitHubService();

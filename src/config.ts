@@ -1,6 +1,7 @@
 export interface Config {
   port: number;
   host: string;
+  adminToken: string;
   github: {
     token: string;
     repo: string;
@@ -15,6 +16,7 @@ function loadConfig(): Config {
   return {
     port: parseInt(process.env.PORT || "3000", 10),
     host: process.env.HOST || "0.0.0.0",
+    adminToken: process.env.ADMIN_TOKEN || "",
     github: {
       token: process.env.GITHUB_TOKEN || "",
       repo: process.env.GITHUB_REPO || "uploadbases/cdn0",
