@@ -122,7 +122,7 @@
       <div class="script-header">
         <div>
           <h3>CLI Upload</h3>
-          <p>Compress the current directory first, then upload the archive. Large files are split by the server automatically.</p>
+          <p>Set the file path, then upload it directly. Large files are split by the server automatically.</p>
         </div>
         <button class="copy-script-btn" id="btnCopyScript">Copy Script</button>
       </div>
@@ -174,22 +174,11 @@
     }
 
     function updateScript() {
-      const script = `#!/usr/bin/env bash
-set -euo pipefail
-
-if [ "$#" -lt 1 ]; then
-  echo "Usage: gh-upload-dir [dir]"
-  exit 1
-fi
-
-TARGET_DIR="${1:-.}"
-DIR_NAME="$(basename "$(cd "$TARGET_DIR" && pwd)")"
-ARCHIVE_NAME="${DIR_NAME}-$(date +%Y%m%d%H%M%S).tar.gz"
-TMP_ARCHIVE="/tmp/${ARCHIVE_NAME}"
-
-tar -czf "$TMP_ARCHIVE" -C "$TARGET_DIR" .
-curl -sS -F "file=@${TMP_ARCHIVE}" "${apiBaseURL}/api/v1/files"
-rm -f "$TMP_ARCHIVE"`;
+      const script = [
+        "FILE_PATH=\"/path/to/file\"",
+        "",
+        "curl -sS -F \"file=@${FILE_PATH}\" \"" + apiBaseURL + "/api/v1/files\""
+      ].join("\n");
       document.getElementById("uploadScript").textContent = script;
     }
 
