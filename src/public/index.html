@@ -152,7 +152,7 @@
     }
     .file-card {
       display: grid;
-      grid-template-columns: minmax(0, 1fr) auto auto;
+      grid-template-columns: minmax(0, 1fr) auto;
       gap: 14px;
       align-items: center;
       padding: 14px;
@@ -171,6 +171,18 @@
       display: flex;
       align-items: center;
       gap: 12px;
+    }
+    .file-details {
+      min-width: 0;
+      display: grid;
+      gap: 4px;
+    }
+    .file-meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 14px;
+      color: #64748b;
+      font-size: 12px;
     }
     .file-icon {
       display: inline-flex;
@@ -191,12 +203,14 @@
       color: #172033;
       font-weight: 700;
     }
-    .file-size {
-      color: #64748b;
-      font-size: 13px;
+    .file-actions {
+      display: flex;
+      align-items: center;
+      gap: 8px;
       white-space: nowrap;
     }
-    .file-open {
+    .file-open,
+    .file-copy {
       padding: 8px 12px;
       border-radius: 999px;
       background: #ecfeff;
@@ -205,6 +219,37 @@
       font-weight: 700;
       text-decoration: none;
       white-space: nowrap;
+    }
+    .file-copy {
+      border: 0;
+      background: #f1f5f9;
+      color: #475569;
+      cursor: pointer;
+    }
+    .pagination {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      margin-top: 14px;
+      color: #64748b;
+      font-size: 13px;
+    }
+    .pagination-actions {
+      display: flex;
+      gap: 8px;
+    }
+    .pagination button {
+      padding: 7px 12px;
+      border: 1px solid #dbe4ee;
+      border-radius: 999px;
+      background: #fff;
+      color: #475569;
+      cursor: pointer;
+    }
+    .pagination button:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
     }
     .table-footer button {
       padding: 8px 14px; background: #f1f5f9; color: #475569;
@@ -216,8 +261,9 @@
       .script-summary,
       .table-header { align-items: flex-start; }
       .file-card { grid-template-columns: minmax(0, 1fr); }
-      .file-size,
-      .file-open { justify-self: start; }
+      .file-actions,
+      .pagination { align-items: flex-start; }
+      .pagination { flex-direction: column; }
     }
   </style>
 </head>
@@ -265,6 +311,7 @@
         </div>
       </div>
       <div class="file-list" id="fileTableBody"></div>
+      <div class="pagination" id="filePagination"></div>
     </div>
   </div>
 
@@ -272,6 +319,9 @@
     let apiBaseURL = window.location.origin;
     let uploadURL = apiBaseURL + "/api/v1/files";
     let selectedFiles = [];
+    let uploadedFiles = [];
+    let currentFilePage = 1;
+    const filesPerPage = 8;
 
     // ---- Helpers ----
     function humanSize(bytes) {
@@ -322,16 +372,73 @@
     function renderFileTable(list) {
       const container = document.getElementById("tableContainer");
       const tbody = document.getElementById("fileTableBody");
-      if (list.length === 0) {
+      const pagination = document.getElementById("filePagination");
+      uploadedFiles = list;
+      if (uploadedFiles.length === 0) {
         container.style.display = "none";
         return;
       }
+
       container.style.display = "block";
-      tbody.innerHTML = list.map(function(f) {
-        return '<div class="file-card"><div class="file-main"><span class="file-icon">&uarr;</span><span class="file-name">' +
-               escapeHtml(f.name || "") + '</span></div><span class="file-size">' + humanSize(f.size) +
-               '</span><a class="file-open" href="' + escapeAttr(f.download_url) + '" target="_blank" rel="noopener">Open</a></div>';
+      const totalPages = Math.max(1, Math.ceil(uploadedFiles.length / filesPerPage));
+      currentFilePage = Math.min(currentFilePage, totalPages);
+      const start = (currentFilePage - 1) * filesPerPage;
+      const pageFiles = uploadedFiles.slice(start, start + filesPerPage);
+
+      tbody.innerHTML = pageFiles.map(function(f, idx) {
+        const absoluteIdx = start + idx;
+        return '<div class="file-card"><div class="file-main"><span class="file-icon">&uarr;</span><div class="file-details"><span class="file-name">' +
+               escapeHtml(f.name || "") + '</span><span class="file-meta"><span>' + humanSize(f.size) +
+               '</span><span>Uploaded ' + formatTimestamp(f.timestamp) +
+               '</span></span></div></div><div class="file-actions"><a class="file-open" href="' +
+               escapeAttr(f.download_url) + '" target="_blank" rel="noopener">Open</a><button class="file-copy" data-idx="' +
+               absoluteIdx + '">Copy</button></div></div>';
       }).join("");
+
+      pagination.innerHTML = uploadedFiles.length > filesPerPage
+        ? '<span>Page ' + currentFilePage + ' of ' + totalPages + ' · ' + uploadedFiles.length +
+          ' files</span><div class="pagination-actions"><button id="btnPrevPage" ' +
+          (currentFilePage === 1 ? "disabled" : "") + '>Prev</button><button id="btnNextPage" ' +
+          (currentFilePage === totalPages ? "disabled" : "") + '>Next</button></div>'
+        : '<span>' + uploadedFiles.length + ' file' + (uploadedFiles.length === 1 ? "" : "s") + '</span>';
+
+      document.querySelectorAll(".file-copy").forEach(function(btn) {
+        btn.addEventListener("click", function() {
+          var idx = parseInt(this.dataset.idx);
+          var file = uploadedFiles[idx];
+          if (file && file.download_url) {
+            copyText(file.download_url, "URL copied");
+          }
+        });
+      });
+
+      var btnPrevPage = document.getElementById("btnPrevPage");
+      var btnNextPage = document.getElementById("btnNextPage");
+      if (btnPrevPage) {
+        btnPrevPage.addEventListener("click", function() {
+          currentFilePage -= 1;
+          renderFileTable(uploadedFiles);
+        });
+      }
+      if (btnNextPage) {
+        btnNextPage.addEventListener("click", function() {
+          currentFilePage += 1;
+          renderFileTable(uploadedFiles);
+        });
+      }
+    }
+
+    function formatTimestamp(timestamp) {
+      if (!timestamp) return "-";
+      return new Date(timestamp * 1000).toLocaleString();
+    }
+
+    function copyText(text, successMessage) {
+      navigator.clipboard.writeText(text).then(function() {
+        alert(successMessage);
+      }).catch(function() {
+        prompt("Copy:", text);
+      });
     }
 
     function escapeHtml(s) {
@@ -386,11 +493,7 @@
         btn.addEventListener("click", function() {
           var idx = parseInt(this.dataset.idx);
           if (selectedFiles[idx] && selectedFiles[idx].url) {
-            navigator.clipboard.writeText(selectedFiles[idx].url).then(function() {
-              alert("URL copied");
-            }).catch(function() {
-              prompt("URL:", selectedFiles[idx].url);
-            });
+            copyText(selectedFiles[idx].url, "URL copied");
           }
         });
       });
@@ -432,11 +535,7 @@
     // ---- Script copy ----
     document.getElementById("btnCopyScript").addEventListener("click", function() {
       var script = document.getElementById("uploadScript").textContent;
-      navigator.clipboard.writeText(script).then(function() {
-        alert("Upload script copied");
-      }).catch(function() {
-        prompt("Copy the script below:", script);
-      });
+      copyText(script, "Upload script copied");
     });
 
     // ---- Clear repo ----
