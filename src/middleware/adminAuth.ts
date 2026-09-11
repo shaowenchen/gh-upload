@@ -20,26 +20,19 @@ function presentedToken(req: Request): string {
 }
 
 /**
- * Require the shared access credential for anything that writes.
+ * Gate on the shared access token.
  *
- * Only writes are guarded. The download URL an upload returns is the thing
- * being delivered, so it has to stay openable by whoever receives it — putting
- * the credential on reads would make every delivered link useless to its
- * recipient.
+ * The token is a global switch: when ADMIN_TOKEN is set, every gated request
+ * must present it; when it is unset, the gate is off and requests pass through.
+ * So an operator who wants no restriction simply leaves it unset.
  *
- * An unset ADMIN_TOKEN fails closed rather than open. Treating "no token
- * configured" as "no protection needed" is how the previous deployment ran:
- * writes were unrestricted and the omission was invisible until someone found
- * the endpoint.
+ * Only writes are gated. The download URL an upload returns is the thing being
+ * delivered, so it has to stay openable by whoever receives it — gating reads
+ * would make every delivered link useless to its recipient.
  */
 export function adminAuth(req: Request, res: Response, next: NextFunction): void {
   if (!config.adminToken) {
-    showError(
-      res,
-      "this server has no ADMIN_TOKEN configured, so writes are disabled",
-      503,
-      false
-    );
+    next();
     return;
   }
 

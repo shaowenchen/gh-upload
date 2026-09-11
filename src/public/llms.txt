@@ -10,11 +10,14 @@ Preferred: fetch and run the uploader this server hosts. It splits large files
 correctly and reads the server's limits, so it cannot drift out of sync.
 
     export GH_UPLOAD_URL="<the server URL you were given>"
-    export GH_UPLOAD_TOKEN="<the access token you were given>"
+    export GH_UPLOAD_TOKEN="<the access token you were given>"   # omit if not needed
 
     curl -fsSL "$GH_UPLOAD_URL/upload.sh" -o upload.sh
     bash upload.sh /path/to/file
     # -> prints the download URL on stdout; progress goes to stderr
+
+`upload.sh` sends the token only when `GH_UPLOAD_TOKEN` is set, so the same
+invocation works whether or not the server requires one.
 
 Small files also work with plain curl:
 
@@ -40,7 +43,8 @@ is what `upload.sh` does.
         "api_base_url": "https://...",          # public base; use this for links
         "upload_url": "https://.../api/v1/files",
         "chunk_size": 16777216,                 # bytes per chunk
-        "max_simple_upload": 16777216           # largest single-request upload
+        "max_simple_upload": 16777216,          # largest single-request upload
+        "auth_required": false                  # whether writes need the token
       }
     }
 
@@ -51,14 +55,17 @@ and resend the same chunk. A retry is always safe — see Idempotency.
 
 ## Authentication
 
-Writes require the access token: `Authorization: Bearer <token>`.
+The access token is a global switch on writes.
 
-Reads do **not**. The download URL is the deliverable, so it stays openable by
-whoever receives the link. Do not append the token to a shared URL.
+- **If the server has one configured**, every write must send it:
+  `Authorization: Bearer <token>`. Without it, writes fail with HTTP 401.
+- **If the server has none configured**, writes need no credential and go
+  through. Run `GET /api/v1/config` and check `auth_required` to find out which
+  applies — do not assume.
 
-If the server has no token configured, every write returns HTTP 503 saying so,
-and writes are impossible until an operator sets one. This is intentional: an
-unconfigured token must not silently mean "no protection".
+Reads are never gated, either way. The download URL is the deliverable, so it
+stays openable by whoever receives the link. Do not append the token to a
+shared URL.
 
 ## Errors
 
@@ -69,11 +76,11 @@ Every failure is JSON with an HTTP status code, never a 200 carrying a failure:
 | Status | Meaning | What to do |
 |---|---|---|
 | 400 | The request is malformed | Fix the request; retrying will not help |
-| 401 | Missing or wrong access token | Check `GH_UPLOAD_TOKEN` |
+| 401 | Missing or wrong access token | Check `GH_UPLOAD_TOKEN` (only when `auth_required` is true) |
 | 404 | No such file id | Check the id |
 | 413 | Body too large | Split the file and use the chunk endpoints |
 | 502 | The git backend failed upstream | Retry — usually transient |
-| 503 | Server shedding load, or writes disabled | If `msg` mentions overload, back off and retry; if it mentions `ADMIN_TOKEN`, stop and tell the operator |
+| 503 | Server shedding load | Back off briefly and retry |
 
 Branch on the HTTP status, not on `code`. `retryable` is an explicit signal for
 the cases where a retry is worthwhile.

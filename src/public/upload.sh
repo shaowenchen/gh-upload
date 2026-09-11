@@ -34,11 +34,15 @@ if [ -z "$BASE" ]; then
 fi
 BASE="${BASE%/}"
 
-# Writes need the credential; reads (the download URL) deliberately do not, so
-# whoever receives a link can open it.
-AUTH=()
+# Writes need the credential when the server has one configured; reads (the
+# download URL) deliberately never do, so whoever receives a link can open it.
+#
+# The flag list is expanded unquoted below. An empty array would be an error
+# under `set -u` on bash 3.2, which macOS still ships, so it is built as a
+# plain string that simply expands to nothing when there is no token.
+AUTH=""
 if [ -n "$TOKEN" ]; then
-  AUTH=(-H "Authorization: Bearer $TOKEN")
+  AUTH="Authorization: Bearer $TOKEN"
 fi
 
 # ---- JSON helpers: prefer jq, fall back to python3 ----
@@ -78,7 +82,11 @@ echo "server: $BASE (chunk size $CHUNK)" >&2
 # ---- small file: one multipart request ----
 if [ "$SIZE" -le "$MAX_SIMPLE" ]; then
   echo "route:  single request" >&2
-  RESP=$(curl -sS --fail "${AUTH[@]}" -F "file=@$FILE" "$BASE/api/v1/files") || {
+  if [ -n "$AUTH" ]; then
+    RESP=$(curl -sS --fail -H "$AUTH" -F "file=@$FILE" "$BASE/api/v1/files")
+  else
+    RESP=$(curl -sS --fail -F "file=@$FILE" "$BASE/api/v1/files")
+  fi || {
     echo "error: upload failed (is GH_UPLOAD_TOKEN set and correct?)" >&2
     exit 1
   }
@@ -104,11 +112,18 @@ send_chunk() {
   while :; do
     attempt=$((attempt + 1))
     local code
-    code=$(curl -sS -o "$TMP/resp.json" -w '%{http_code}' \
-      "${AUTH[@]}" \
-      --data-binary "@$file" \
-      -H "Content-Type: application/octet-stream" \
-      "$BASE/api/v1/files/chunks?upload_id=$UPLOAD_ID&index=$idx&total=$TOTAL") || code=000
+    if [ -n "$AUTH" ]; then
+      code=$(curl -sS -o "$TMP/resp.json" -w '%{http_code}' \
+        -H "$AUTH" \
+        --data-binary "@$file" \
+        -H "Content-Type: application/octet-stream" \
+        "$BASE/api/v1/files/chunks?upload_id=$UPLOAD_ID&index=$idx&total=$TOTAL") || code=000
+    else
+      code=$(curl -sS -o "$TMP/resp.json" -w '%{http_code}' \
+        --data-binary "@$file" \
+        -H "Content-Type: application/octet-stream" \
+        "$BASE/api/v1/files/chunks?upload_id=$UPLOAD_ID&index=$idx&total=$TOTAL") || code=000
+    fi
     case "$code" in
       200)
         printf '%s' "$(json_get 'd["data"]["blob_sha"]' < "$TMP/resp.json")"
@@ -149,8 +164,13 @@ done
 # the content needs to be sent.
 BODY="{\"original_name\":\"$NAME\",\"size\":$SIZE,\"total_chunks\":$TOTAL,\"chunks\":[$BLOBS]}"
 
-RESP=$(curl -sS -X POST "${AUTH[@]}" -H "Content-Type: application/json" \
-  --data-binary "$BODY" "$BASE/api/v1/files/complete") || {
+if [ -n "$AUTH" ]; then
+  RESP=$(curl -sS -X POST -H "$AUTH" -H "Content-Type: application/json" \
+    --data-binary "$BODY" "$BASE/api/v1/files/complete")
+else
+  RESP=$(curl -sS -X POST -H "Content-Type: application/json" \
+    --data-binary "$BODY" "$BASE/api/v1/files/complete")
+fi || {
   echo "error: finalize failed" >&2
   exit 1
 }

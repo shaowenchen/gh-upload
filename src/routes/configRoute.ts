@@ -27,5 +27,8 @@ configRouter.get("/", (req, res) => {
     // A client needs this to pick between the single-request and chunked paths;
     // sending something larger than it to POST /api/v1/files is rejected.
     max_simple_upload: MAX_SIMPLE_UPLOAD,
+    // A client should ask rather than assume: an operator may run this with the
+    // token unset, in which case writes need no credential.
+    auth_required: Boolean(config.adminToken),
   });
 });

@@ -306,7 +306,7 @@
     <!-- Access token: writes require it, so uploads need it present -->
     <div class="token-row">
       <label for="tokenInput">Access token</label>
-      <input type="password" id="tokenInput" placeholder="paste the upload token" autocomplete="off">
+      <input type="password" id="tokenInput" placeholder="only needed if the server requires one" autocomplete="off">
       <span class="token-note" id="tokenNote"></span>
     </div>
 
@@ -393,6 +393,12 @@
         if (json.data && json.data.chunk_size) {
           CHUNK_SIZE = json.data.chunk_size;
         }
+        // Say what the server expects instead of leaving the operator to guess:
+        // an unset token on the server means uploads need no credential.
+        setTokenNote(
+          json.data && json.data.auth_required ? "required by this server" : "not required",
+          false
+        );
         updateScript();
       } catch (e) {
         console.error("Error loading config:", e);
@@ -764,15 +770,12 @@ bash upload.sh /path/to/file`;
     // ---- Init ----
     var tokenInput = document.getElementById("tokenInput");
     tokenInput.value = getToken();
-    if (!getToken()) {
-      setTokenNote("required to upload", true);
-    }
     tokenInput.addEventListener("input", function() {
       try {
         if (this.value) localStorage.setItem(TOKEN_KEY, this.value);
         else localStorage.removeItem(TOKEN_KEY);
       } catch (e) { /* storage may be unavailable; the field still works */ }
-      setTokenNote(this.value ? "saved" : "required to upload", !this.value);
+      setTokenNote(this.value ? "saved" : "", false);
     });
 
     loadConfig().then(loadFileList);

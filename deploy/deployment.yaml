@@ -27,8 +27,8 @@ spec:
               value: "3000"
             - name: HOST
               value: "0.0.0.0"
-            # REQUIRED for writes. Uploads are refused with HTTP 503 while this
-            # is empty. Replace with a real secret before deploying, e.g.:
+            # Access token for writes. Empty means no restriction: uploads are
+            # accepted without a credential. Set it to require one, e.g.:
             #   kubectl -n ops-system create secret generic gh-upload \
             #     --from-literal=admin-token="$(openssl rand -hex 32)"
             # then use valueFrom.secretKeyRef instead of a literal below.
