@@ -12,6 +12,10 @@ export interface Config {
     commitName: string;
   };
   downloadUrls: string[];
+  /** HMAC secret for signed download links; empty disables signing. */
+  downloadSecret: string;
+  /** Lifetime of a signed download link, in seconds. */
+  downloadTtlSeconds: number;
 }
 
 function loadConfig(): Config {
@@ -31,6 +35,8 @@ function loadConfig(): Config {
       .split(",")
       .map((s) => s.trim())
       .filter(Boolean),
+    downloadSecret: process.env.DOWNLOAD_SECRET || "",
+    downloadTtlSeconds: Math.max(1, parseInt(process.env.DOWNLOAD_TTL || "604800", 10) || 604800),
   };
 }
 

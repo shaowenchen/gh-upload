@@ -44,6 +44,13 @@ spec:
               value: "auto@auto.com"
             - name: GITHUB_COMMIT_NAME
               value: "none"
+            # Signing secret for download links. Empty = links never expire.
+            #   kubectl -n ops-system create secret generic gh-upload \
+            #     --from-literal=download-secret="$(openssl rand -hex 32)"
+            - name: DOWNLOAD_SECRET
+              value: ""
+            - name: DOWNLOAD_TTL
+              value: "604800"
             - name: DOWNLOAD_URLS
               value: ""
           readinessProbe:

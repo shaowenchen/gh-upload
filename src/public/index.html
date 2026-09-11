@@ -269,6 +269,7 @@
       display: flex;
       gap: 8px;
     }
+    .link-note { margin-top: 10px; font-size: 12px; color: #94a3b8; text-align: right; }
     .pagination button {
       padding: 7px 12px;
       border: 1px solid #dbe4ee;
@@ -348,6 +349,7 @@
         </div>
       </div>
       <div class="file-list" id="fileTableBody"></div>
+      <p class="link-note" id="linkNote"></p>
       <div class="pagination" id="filePagination"></div>
     </div>
   </div>
@@ -399,6 +401,12 @@
           json.data && json.data.auth_required ? "required by this server" : "not required",
           false
         );
+        // Tell the operator when links stop working, since the page hands them out.
+        if (json.data && json.data.signed_links && json.data.link_ttl_seconds) {
+          var hrs = Math.round(json.data.link_ttl_seconds / 3600);
+          document.getElementById("linkNote").textContent =
+            "Download links expire after " + (hrs >= 24 ? Math.round(hrs / 24) + " day(s)" : hrs + " hour(s)") + ".";
+        }
         updateScript();
       } catch (e) {
         console.error("Error loading config:", e);

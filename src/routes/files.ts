@@ -13,11 +13,9 @@ import {
   fileIdFromContentHash,
   isValidUploadId,
   sanitizeFilename,
-  splitTime,
   isGeneratedName,
   manifestName,
   partName,
-  simpleStoragePath,
   HASH_ALGORITHM,
   contentHashFromBlobs,
   MAX_CONCURRENT_CHUNKS,
@@ -26,6 +24,7 @@ import {
 } from "../utils/chunk.js";
 import { MAX_SIMPLE_UPLOAD } from "../utils/limits.js";
 import { adminAuth } from "../middleware/adminAuth.js";
+import { signPath, verifyPath } from "../utils/signing.js";
 
 const upload = multer({ dest: os.tmpdir() });
 
@@ -258,7 +257,7 @@ filesRouter.post("/complete", adminAuth, express.json({ limit: "1mb" }), async (
       name: originalName,
       size,
       content_hash: contentHash,
-      download_url: buildPublicURL(req, `/api/v1/files/${fileId}/download`),
+      download_url: downloadURL(req, fileId),
     });
   } catch (err) {
     console.error(err);
@@ -289,18 +288,55 @@ filesRouter.post("/", adminAuth, upload.single("file"), async (req, res) => {
 
     const github = new GitHubService();
     const content = await readFile(file.path);
-    const repoPath = simpleStoragePath(originalName, Date.now());
     const blobSha = await github.createBlob(content);
-    await github.commitFiles([{ path: repoPath, sha: blobSha }], `Upload ${originalName}`);
+    const contentHash = contentHashFromBlobs([blobSha]);
+    const fileId = fileIdFromContentHash(contentHash);
+
+    // Stored in the same shape as a chunked upload — one chunk of one blob —
+    // rather than as a bare repo path. A bare path could only be served by
+    // linking straight to raw.githubusercontent.com, which bypasses this server
+    // entirely: it cannot be signed or have an expiry, and it needs the
+    // repository to be public. Routing every download through the manifest
+    // keeps one storage model and one signable URL shape.
+    const manifest: ChunkManifest = {
+      version: 2,
+      file_id: fileId,
+      original_name: originalName,
+      content_type: file.mimetype || "application/octet-stream",
+      size: file.size,
+      chunk_size: content.length,
+      total_chunks: 1,
+      content_hash: contentHash,
+      hash_algorithm: HASH_ALGORITHM,
+      chunks: [
+        {
+          index: 1,
+          name: partName(fileId, 1, 1),
+          size: content.length,
+          blob_sha: blobSha,
+        },
+      ],
+      created_at: Math.floor(Date.now() / 1000),
+    };
+
+    const manifestBlob = await github.createBlob(
+      Buffer.from(JSON.stringify(manifest, null, 2), "utf-8")
+    );
+    await github.commitFiles(
+      [
+        { path: manifest.chunks[0].name, sha: blobSha },
+        { path: manifestName(fileId), sha: manifestBlob },
+      ],
+      `Upload ${originalName}`
+    );
 
     showData(res, {
+      file_id: fileId,
       name: originalName,
       size: file.size,
-      // Same construction as the chunked path, so a one-chunk file has one
-      // identity regardless of which route carried it.
-      content_hash: contentHashFromBlobs([blobSha]),
-      content_type: file.mimetype || "application/octet-stream",
-      download_url: buildRawURL(repoPath),
+      content_hash: contentHash,
+      content_type: manifest.content_type,
+      download_url: downloadURL(req, fileId),
     });
   } catch (err) {
     console.error(err);
@@ -331,19 +367,12 @@ filesRouter.get("/", async (req, res) => {
       download_url: string;
     }> = [];
 
+    // Every stored file is a manifest plus its chunks; anything else in the
+    // tree (the bootstrap README, for instance) is not a file this service
+    // manages and is not listed.
     const manifests: string[] = [];
-    for (const [path, entry] of entries) {
-      if (isGeneratedName(path)) {
-        if (path.endsWith(".manifest.json")) manifests.push(path);
-        continue;
-      }
-      const [timeStamp, filename] = splitTime(path);
-      result.push({
-        size: entry.size,
-        name: filename,
-        timestamp: timeStamp,
-        download_url: buildRawURL(path),
-      });
+    for (const path of entries.keys()) {
+      if (path.endsWith(".manifest.json")) manifests.push(path);
     }
 
     // The tree listing already gives every plain file's size, so only manifests
@@ -367,7 +396,7 @@ filesRouter.get("/", async (req, res) => {
         name: manifest.original_name,
         content_hash: manifest.content_hash,
         timestamp: manifest.created_at,
-        download_url: buildPublicURL(req, `/api/v1/files/${manifest.file_id}/download`),
+        download_url: downloadURL(req, manifest.file_id),
       });
     }
 
@@ -399,7 +428,7 @@ filesRouter.get("/:id", async (req, res) => {
       content_type: manifest.content_type,
       created_at: manifest.created_at,
       total_chunks: manifest.total_chunks,
-      download_url: buildPublicURL(req, `/api/v1/files/${fileId}/download`),
+      download_url: downloadURL(req, fileId),
     });
   } catch {
     showError(res, "file not found", 404);
@@ -411,6 +440,29 @@ filesRouter.get("/:id/download", async (req, res) => {
   const fileId = req.params.id;
   if (!isValidUploadId(fileId)) {
     showError(res, "invalid file id", 400);
+    return;
+  }
+
+  // When signing is configured, the link's expiry and signature are part of
+  // the authorization. A link that has aged out is a normal outcome, not an
+  // error in the request, so it says which it is and how to get a new one.
+  const check = verifyPath(`/api/v1/files/${fileId}/download`, {
+    expires: req.query.expires ? Number(req.query.expires) : undefined,
+    sig: typeof req.query.sig === "string" ? req.query.sig : undefined,
+  });
+  if (!check.ok) {
+    if (check.reason === "expired") {
+      showError(res, "this download link has expired", 410, false);
+      return;
+    }
+    showError(
+      res,
+      check.reason === "missing"
+        ? "this download link is missing its signature"
+        : "this download link is not valid",
+      403,
+      false
+    );
     return;
   }
 
@@ -476,21 +528,27 @@ async function loadManifest(
  * caller dialled, which for an in-cluster client is a .svc address that nothing
  * outside the cluster can resolve.
  */
-function buildPublicURL(req: Request, urlPath: string): string {
-  if (config.downloadUrls.length > 0) {
-    return `https://${config.downloadUrls[0]}${urlPath}`;
-  }
-  const proto =
-    (req.headers["x-forwarded-proto"] as string) ||
-    (req.socket && "encrypted" in req.socket ? "https" : "http");
-  return `${proto}://${req.headers.host}${urlPath}`;
-}
-
-/** Build a direct raw URL for a file stored as a plain repo path. */
-function buildRawURL(repoPath: string): string {
-  const raw = `https://raw.githubusercontent.com/${config.github.repo}/${config.github.branch}/${repoPath}`;
-  if (config.downloadUrls.length === 0) return raw;
-  return raw.replace("raw.githubusercontent.com", config.downloadUrls[0]);
+/**
+ * Build a signed download URL for a file.
+ *
+ * Prefers the configured public hostname: req.headers.host is whatever the
+ * caller dialled, which for an in-cluster client is a .svc address that nothing
+ * outside the cluster can resolve.
+ */
+function downloadURL(req: Request, fileId: string): string {
+  const path = `/api/v1/files/${fileId}/download`;
+  const base =
+    config.downloadUrls.length > 0
+      ? `https://${config.downloadUrls[0]}`
+      : (() => {
+          const proto =
+            (req.headers["x-forwarded-proto"] as string) ||
+            (req.socket && "encrypted" in req.socket ? "https" : "http");
+          return `${proto}://${req.headers.host}`;
+        })();
+  // Signed over the request path (not the host) so the same signature remains
+  // valid whichever hostname the link is reached through.
+  return `${base}${path}${signPath(path)}`;
 }
 
 /**

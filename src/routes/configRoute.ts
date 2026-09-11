@@ -3,6 +3,7 @@ import { showData } from "../utils/response.js";
 import { config } from "../config.js";
 import { CHUNK_SIZE } from "../utils/chunk.js";
 import { MAX_SIMPLE_UPLOAD } from "../utils/limits.js";
+import { signingEnabled, linkTtlSeconds } from "../utils/signing.js";
 
 export const configRouter = Router();
 
@@ -30,5 +31,9 @@ configRouter.get("/", (req, res) => {
     // A client should ask rather than assume: an operator may run this with the
     // token unset, in which case writes need no credential.
     auth_required: Boolean(config.adminToken),
+    // A caller should know whether download links expire, so it can either
+    // deliver promptly or arrange a fresh link.
+    signed_links: signingEnabled(),
+    link_ttl_seconds: signingEnabled() ? linkTtlSeconds() : null,
   });
 });

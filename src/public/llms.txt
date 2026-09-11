@@ -63,9 +63,25 @@ The access token is a global switch on writes.
   through. Run `GET /api/v1/config` and check `auth_required` to find out which
   applies — do not assume.
 
-Reads are never gated, either way. The download URL is the deliverable, so it
-stays openable by whoever receives the link. Do not append the token to a
-shared URL.
+Reads are never gated by the access token, either way. The download URL is the
+deliverable, so it stays openable by whoever receives the link. Do not append
+the token to a shared URL.
+
+## Download links may expire
+
+The server may sign download links with an expiry. Check `GET /api/v1/config`:
+when `signed_links` is true, every link carries `?expires=...&sig=...` and stops
+working after `link_ttl_seconds`.
+
+- **Deliver the link as issued.** Do not strip, reformat or rebuild the query
+  string — the signature covers the path and the expiry, so any edit breaks it.
+- **An expired link is HTTP 410**, distinct from 403 (altered or not issued by
+  this server). To get a fresh link, re-read the file's metadata or re-run the
+  upload: links are reissued on demand and the file itself is unchanged.
+- If you need a link that outlives the TTL, ask the operator to raise
+  `DOWNLOAD_TTL`; there is no way to mint a longer-lived one from a client.
+
+When `signed_links` is false, links never expire and carry no query string.
 
 ## Errors
 
@@ -77,7 +93,9 @@ Every failure is JSON with an HTTP status code, never a 200 carrying a failure:
 |---|---|---|
 | 400 | The request is malformed | Fix the request; retrying will not help |
 | 401 | Missing or wrong access token | Check `GH_UPLOAD_TOKEN` (only when `auth_required` is true) |
+| 403 | Link signature missing or altered | Use the URL exactly as issued |
 | 404 | No such file id | Check the id |
+| 410 | The download link expired | Obtain a fresh link from the file's metadata |
 | 413 | Body too large | Split the file and use the chunk endpoints |
 | 502 | The git backend failed upstream | Retry — usually transient |
 | 503 | Server shedding load | Back off briefly and retry |
@@ -121,8 +139,9 @@ above on failure. `{auth}` marks the endpoints needing the bearer token.
 
     POST /api/v1/files                        {auth}
       multipart/form-data, field "file"
-      -> {name, size, content_hash, content_type, download_url}
-      Fails with 413 above max_simple_upload.
+      -> {file_id, name, size, content_hash, content_type, download_url}
+      Fails with 413 above max_simple_upload. Stored in the same form as a
+      chunked upload, so its download_url is a normal (possibly signed) link.
 
     POST /api/v1/files/chunks                 {auth}
       ?upload_id=<32 hex chars>&index=<1..total>&total=<n>
@@ -153,7 +172,10 @@ above on failure. `{auth}` marks the endpoints needing the bearer token.
          hash_algorithm, content_type, created_at, total_chunks, download_url}
 
     GET  /api/v1/files/<file_id>/download
-      -> the file bytes, no auth required
+      -> the file bytes. No access token required, but a signed link's
+         ?expires=&sig= must be sent exactly as issued.
+         403 = signature missing, altered, or not issued by this server.
+         410 = the link expired; obtain a new one.
 
     POST /api/v1/clear                        {auth}
       DESTRUCTIVE: deletes the ENTIRE repository and every file in it. There is
