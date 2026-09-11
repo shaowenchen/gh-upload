@@ -10,6 +10,24 @@ const REPO_CACHE_TTL_MS = 60_000;
 /** Attempts to land a commit before giving up on ref contention. */
 const COMMIT_MAX_ATTEMPTS = 5;
 
+/**
+ * Committed as the repository's first commit, to bring it into existence.
+ * The git-data API cannot write to a repository with no commits, so something
+ * has to be committed first — this says what the repository holds.
+ */
+const BOOTSTRAP_README = `# upload repository
+
+Managed by [gh-upload](https://github.com/shaowenchen/gh-upload).
+
+This repository stores files uploaded through the gh-upload service and is
+written to automatically. Do not edit it by hand: files are committed with
+generated names, and each stored file is identified by a manifest describing
+its chunks.
+
+This README exists because git requires a repository to have a commit before
+its object store can be written to.
+`;
+
 export interface RepoInfo {
   name: string;
   defaultBranch: string;
@@ -35,6 +53,8 @@ export class GitHubService {
   private isOrg: boolean | null = null;
   private repoPromise: Promise<RepoInfo> | null = null;
   private repoCachedAt = 0;
+  /** Repos already known to have a commit, so the probe runs once each. */
+  private bootstrapped = new Set<string>();
 
   constructor() {
     this.octokit = new Octokit({
@@ -114,6 +134,7 @@ export class GitHubService {
    */
   async createBlob(content: Buffer): Promise<string> {
     const repo = await this.getOrCreateRepo();
+    await this.ensureWritable(repo);
     const { data } = await this.octokit.rest.git.createBlob({
       owner: REPO_OWNER,
       repo: repo.name,
@@ -176,14 +197,92 @@ export class GitHubService {
     return this.getBlob(entry.sha);
   }
 
+  /**
+   * Make sure the target branch exists and the repository has a commit.
+   *
+   * The git-data API refuses to write to a repository with no commits — creating
+   * a blob answers 409 "Git Repository is empty", because there is no commit for
+   * the objects to belong to. A brand-new repository is exactly that, so the
+   * first commit has to come from the Contents API, which does create one.
+   *
+   * The initial commit carries a README describing what the repository is for.
+   * Something has to be committed to bootstrap it, and a note explaining the
+   * contents is more honest than an empty placeholder.
+   */
+  private async ensureWritable(repo: RepoInfo): Promise<void> {
+    if (this.bootstrapped.has(repo.name)) return;
+
+    const head = await this.getBranchHead(repo);
+    if (head) {
+      this.bootstrapped.add(repo.name);
+      return;
+    }
+
+    // The target branch may simply not exist yet on a repo that does have
+    // commits — then it only needs to be branched off the default branch.
+    const defaultHead = await this.getBranchHead({
+      name: repo.name,
+      defaultBranch: repo.defaultBranch,
+    }, repo.defaultBranch);
+
+    if (!defaultHead) {
+      const filePath = "README.md";
+      await this.octokit.rest.repos.createOrUpdateFileContents({
+        owner: REPO_OWNER,
+        repo: repo.name,
+        path: filePath,
+        message: "Initialize upload repository",
+        content: Buffer.from(BOOTSTRAP_README, "utf-8").toString("base64"),
+        branch: repo.defaultBranch,
+        author: { name: this.commitName, email: this.commitEmail },
+        committer: { name: this.commitName, email: this.commitEmail },
+      });
+      this.bootstrapped.add(repo.name);
+      if (repo.defaultBranch === this.branch) return;
+    }
+
+    await this.createBranchIfMissing(repo, repo.defaultBranch);
+    this.bootstrapped.add(repo.name);
+  }
+
+  /** Point the target branch at the given source branch's head, if absent. */
+  private async createBranchIfMissing(
+    repo: RepoInfo,
+    sourceBranch: string
+  ): Promise<void> {
+    try {
+      await this.octokit.rest.git.getRef({
+        owner: REPO_OWNER,
+        repo: repo.name,
+        ref: `heads/${this.branch}`,
+      });
+      return; // already there
+    } catch {
+      // fall through to create it
+    }
+    const source = await this.getBranchHead(
+      { name: repo.name, defaultBranch: sourceBranch },
+      sourceBranch
+    );
+    if (!source) throw new Error(`source branch has no commits: ${sourceBranch}`);
+    await this.octokit.rest.git.createRef({
+      owner: REPO_OWNER,
+      repo: repo.name,
+      ref: `refs/heads/${this.branch}`,
+      sha: source.commitSha,
+    });
+  }
+
   private async getBranchHead(
-    repo: RepoInfo
+    repo: RepoInfo,
+    branch?: string
   ): Promise<{ commitSha: string; treeSha: string } | null> {
+    const target = branch ?? this.branch;
     try {
       const { data: ref } = await this.octokit.rest.git.getRef({
         owner: REPO_OWNER,
         repo: repo.name,
-        ref: `heads/${this.branch}`,
+        ref: `heads/${target}`,
       });
       const { data: commit } = await this.octokit.rest.git.getCommit({
         owner: REPO_OWNER,
@@ -192,7 +291,7 @@ export class GitHubService {
       });
       return { commitSha: ref.object.sha, treeSha: commit.tree.sha };
     } catch {
-      // Branch (or repo) does not exist yet.
+      // Branch (or repo) does not exist, or the repo has no commits at all.
       return null;
     }
   }
@@ -208,6 +307,7 @@ export class GitHubService {
   async commitFiles(files: FileToCommit[], message: string): Promise<string> {
     if (files.length === 0) throw new Error("nothing to commit");
     const repo = await this.getOrCreateRepo();
+    await this.ensureWritable(repo);
 
     for (let attempt = 1; attempt <= COMMIT_MAX_ATTEMPTS; attempt++) {
       const head = await this.getBranchHead(repo);

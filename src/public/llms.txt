@@ -1,0 +1,180 @@
+# gh-upload
+
+File hosting backed by a git repository. Upload a file, get a permanent public
+URL back. Intended for delivering build artifacts, reports, logs and other
+files to people or agents that need a link.
+
+## Fast path
+
+Preferred: fetch and run the uploader this server hosts. It splits large files
+correctly and reads the server's limits, so it cannot drift out of sync.
+
+    export GH_UPLOAD_URL="<the server URL you were given>"
+    export GH_UPLOAD_TOKEN="<the access token you were given>"
+
+    curl -fsSL "$GH_UPLOAD_URL/upload.sh" -o upload.sh
+    bash upload.sh /path/to/file
+    # -> prints the download URL on stdout; progress goes to stderr
+
+Small files also work with plain curl:
+
+    curl -sS -H "Authorization: Bearer $GH_UPLOAD_TOKEN" \
+         -F "file=@/path/to/file" "$GH_UPLOAD_URL/api/v1/files"
+
+## Read this before doing it yourself
+
+**Do not POST a large file to `/api/v1/files` in one request.** A body larger
+than `max_simple_upload` is rejected with HTTP 413 by the CDN in front of the
+server, and that response comes from the CDN as **HTML, not JSON** — so a JSON
+parser will fail on it rather than give you a useful error. Files above that
+size must be split and sent through `/api/v1/files/chunks` + `/complete`, which
+is what `upload.sh` does.
+
+**Ask the server for its limits rather than assuming them:**
+
+    curl -sS "$GH_UPLOAD_URL/api/v1/config"
+
+    {
+      "code": 0,
+      "data": {
+        "api_base_url": "https://...",          # public base; use this for links
+        "upload_url": "https://.../api/v1/files",
+        "chunk_size": 16777216,                 # bytes per chunk
+        "max_simple_upload": 16777216           # largest single-request upload
+      }
+    }
+
+**Concurrency is limited server-side.** Sending many chunks at once is fine and
+is what the script does, but the server admits only a few at a time and answers
+HTTP 503 with `"retryable": true` for the rest. Honour that: back off briefly
+and resend the same chunk. A retry is always safe — see Idempotency.
+
+## Authentication
+
+Writes require the access token: `Authorization: Bearer <token>`.
+
+Reads do **not**. The download URL is the deliverable, so it stays openable by
+whoever receives the link. Do not append the token to a shared URL.
+
+If the server has no token configured, every write returns HTTP 503 saying so,
+and writes are impossible until an operator sets one. This is intentional: an
+unconfigured token must not silently mean "no protection".
+
+## Errors
+
+Every failure is JSON with an HTTP status code, never a 200 carrying a failure:
+
+    { "code": -1, "msg": "human readable reason", "retryable": true|false }
+
+| Status | Meaning | What to do |
+|---|---|---|
+| 400 | The request is malformed | Fix the request; retrying will not help |
+| 401 | Missing or wrong access token | Check `GH_UPLOAD_TOKEN` |
+| 404 | No such file id | Check the id |
+| 413 | Body too large | Split the file and use the chunk endpoints |
+| 502 | The git backend failed upstream | Retry — usually transient |
+| 503 | Server shedding load, or writes disabled | If `msg` mentions overload, back off and retry; if it mentions `ADMIN_TOKEN`, stop and tell the operator |
+
+Branch on the HTTP status, not on `code`. `retryable` is an explicit signal for
+the cases where a retry is worthwhile.
+
+## Idempotency and retries
+
+Retrying is safe and will not produce duplicates:
+
+- Chunks are written as content-addressed git blobs, so re-sending identical
+  bytes resolves to the same object.
+- The file's identity is derived from its chunk ids, not from a client-supplied
+  value, so the same file always lands on the same id.
+- The final commit is a single atomic ref update. A partial upload is never
+  visible: either the whole file exists or none of it does.
+
+An interrupted `upload.sh` can simply be re-run.
+
+## Uploading the same content twice
+
+Identity is derived from content, not from the filename or the upload session.
+Two uploads with identical bytes produce the **same `file_id`**, so the second
+replaces the first's manifest and `GET /api/v1/files` shows one entry — with the
+name from the most recent upload. This is intended (it is what makes retries
+safe), but it means you cannot store two files with identical content under
+different names.
+
+To keep several versions, vary the content or the name in a way that changes the
+bytes. A file's size and bytes are what identify it, not its name.
+
+## API reference
+
+All responses are `{"code": 0, "data": ...}` on success and the error shape
+above on failure. `{auth}` marks the endpoints needing the bearer token.
+
+    GET  /api/v1/config
+    GET  /api/version
+    GET  /health
+
+    POST /api/v1/files                        {auth}
+      multipart/form-data, field "file"
+      -> {name, size, content_hash, content_type, download_url}
+      Fails with 413 above max_simple_upload.
+
+    POST /api/v1/files/chunks                 {auth}
+      ?upload_id=<32 hex chars>&index=<1..total>&total=<n>
+      Body: raw bytes (Content-Type: application/octet-stream)
+      -> {upload_id, index, size, sha256, blob_sha}
+      Every chunk except the last must be exactly chunk_size bytes.
+      upload_id is any 32-character hex string you choose; it only labels the
+      session. Retries may reuse it.
+      HTTP 503 here means overload: back off and resend.
+
+    POST /api/v1/files/complete               {auth}
+      {"original_name": "report.pdf",
+       "size": 41943040,
+       "total_chunks": 3,
+       "content_type": "application/pdf",     (optional)
+       "chunks": ["<blob_sha>", "<blob_sha>", "<blob_sha>"]}
+      -> {file_id, name, size, content_hash, download_url}
+      Send the blob ids in order; chunk entries may be bare strings or the
+      objects returned by /chunks. Do not send sizes — the server derives them
+      from `size`, and a wrong value would corrupt the file rather than error.
+
+    GET  /api/v1/files
+      -> {list: [{name, size, timestamp, download_url, content_hash?}]}
+      Newest first. `timestamp` is unix seconds.
+
+    GET  /api/v1/files/<file_id>
+      -> metadata for a chunked upload: {file_id, name, size, content_hash,
+         hash_algorithm, content_type, created_at, total_chunks, download_url}
+
+    GET  /api/v1/files/<file_id>/download
+      -> the file bytes, no auth required
+
+    POST /api/v1/clear                        {auth}
+      DESTRUCTIVE: deletes the ENTIRE repository and every file in it. There is
+      no per-file delete. Never call this unless explicitly instructed to remove
+      everything.
+
+## content_hash
+
+`content_hash` identifies a file. It is the sha256 of the ordered chunk blob
+ids, which is **not** the sha256 of the file bytes — clients never hash the file
+(a browser cannot hash a stream, so it would have to buffer all of it). The
+manifest records this as `hash_algorithm: "sha256-git-blob-ids-v1"`.
+
+Use it to compare two uploads for sameness. Do not present it as a checksum of
+the file's contents.
+
+## Verifying a download
+
+The server checks chunk integrity when streaming, and each download sets an
+exact `Content-Length`, so a truncated transfer is detectable:
+
+    curl -fsSL -o out.bin "$DOWNLOAD_URL"
+    # compare byte count against the "size" reported at upload time
+
+## Notes for agents
+
+- The download URL is public and permanent. Treat it as the deliverable.
+- Do not re-upload unchanged files: the id is content-derived, and the same
+  content lands on the same id.
+- There is no TTL and no per-file delete. Uploaded files accumulate; ask an
+  operator to clear the repository if that matters.

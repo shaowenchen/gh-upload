@@ -93,6 +93,20 @@
       border-radius: 4px; background: #fff; cursor: pointer;
     }
 
+    /* Access token */
+    .token-row {
+      display: flex; align-items: center; gap: 10px; margin-top: 14px;
+      padding: 10px 14px; background: #fff; border: 1px solid #e2e8f0;
+      border-radius: 12px;
+    }
+    .token-row label { font-size: 13px; color: #475569; white-space: nowrap; }
+    .token-row input {
+      flex: 1; min-width: 0; padding: 7px 10px; font-size: 13px;
+      border: 1px solid #dbe4ee; border-radius: 8px; font-family: monospace;
+    }
+    .token-row input:invalid { border-color: #fca5a5; }
+    .token-note { font-size: 12px; color: #94a3b8; }
+
     .upload-actions { display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end; }
     .upload-actions button {
       padding: 8px 20px; border: none; border-radius: 6px;
@@ -289,6 +303,13 @@
       <img class="brand-logo" src="/logo.svg" alt="GH Upload">
     </header>
 
+    <!-- Access token: writes require it, so uploads need it present -->
+    <div class="token-row">
+      <label for="tokenInput">Access token</label>
+      <input type="password" id="tokenInput" placeholder="paste the upload token" autocomplete="off">
+      <span class="token-note" id="tokenNote"></span>
+    </div>
+
     <!-- Upload Zone -->
     <div class="upload-zone" id="dropZone">
       <img class="upload-zone-icon" src="/favicon.svg" alt="">
@@ -379,43 +400,13 @@
     }
 
     function updateScript() {
-      // Shell var references are escaped (\${...}) so the template literal only
-      // interpolates the values this function actually supplies.
-      const script = `FILE_PATH="/path/to/file"
-CHUNK=${CHUNK_SIZE}
+      // Fetch and run the uploader this server hosts, so a shell client never
+      // has to reimplement the chunking or guess the limits.
+      const script = `export GH_UPLOAD_URL="${apiBaseURL}"
+export GH_UPLOAD_TOKEN="<your access token>"
 
-SIZE=$(stat -f%z "$FILE_PATH" 2>/dev/null || stat -c%s "$FILE_PATH")
-
-# A file that fits in one chunk goes up in a single request.
-if [ "$SIZE" -le "$CHUNK" ]; then
-  curl -sS -F "file=@\${FILE_PATH}" "${apiBaseURL}/api/v1/files"
-  exit $?
-fi
-
-# Anything larger has to be split here, because a single body of that size is
-# rejected by the CDN edge (413) before it ever reaches the server.
-TOTAL=$(( (SIZE + CHUNK - 1) / CHUNK ))
-UPLOAD_ID=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d " \\n" | cut -c1-32)
-
-CHUNKS="[]"
-for I in $(seq 1 "$TOTAL"); do
-  RESP=$(dd if="\${FILE_PATH}" bs="$CHUNK" skip=$((I - 1)) count=1 2>/dev/null \\
-    | curl -sS --data-binary @- \\
-        "${apiBaseURL}/api/v1/files/chunks?upload_id=\${UPLOAD_ID}&index=\${I}&total=\${TOTAL}" \\
-        -H "Content-Type: application/octet-stream")
-  CHUNKS=$(printf '%s' "$CHUNKS" | jq -c --argjson r "$RESP" '. + [$r.data]')
-done
-
-# File identity is the sha256 of the chunk digests concatenated in order
-# (sha256-chunked-v1) — see hash_algorithm in the manifest.
-CONTENT_HASH=$(printf '%s' "$CHUNKS" | jq -r 'map(.sha256) | join("")' \\
-  | shasum -a 256 | cut -d" " -f1)
-
-jq -n --arg name "$(basename "\${FILE_PATH}")" --argjson size "$SIZE" \\
-      --argjson total "$TOTAL" --arg hash "$CONTENT_HASH" --argjson chunks "$CHUNKS" \\
-      '{original_name: $name, size: $size, total_chunks: $total, content_hash: $hash, chunks: $chunks}' \\
-| curl -sS -X POST "${apiBaseURL}/api/v1/files/complete" \\
-    -H "Content-Type: application/json" --data-binary @-`;
+curl -fsSL "$GH_UPLOAD_URL/upload.sh" -o upload.sh
+bash upload.sh /path/to/file`;
       document.getElementById("uploadScript").textContent = script;
     }
 
@@ -576,27 +567,33 @@ jq -n --arg name "$(basename "\${FILE_PATH}")" --argjson size "$SIZE" \\
       renderQueue();
     });
 
+    // ---- Access token ----
+    // Stored in localStorage for convenience. It is a shared credential, not a
+    // per-user login, so anything running in this browser can read it — fine
+    // for an internal tool, not for a public deployment.
+    var TOKEN_KEY = "gh-upload-token";
+
+    function getToken() {
+      try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
+    }
+
+    function authHeaders(extra) {
+      var t = getToken();
+      var h = extra || {};
+      if (t) h["Authorization"] = "Bearer " + t;
+      return h;
+    }
+
+    function setTokenNote(msg, isError) {
+      var el = document.getElementById("tokenNote");
+      el.textContent = msg || "";
+      el.style.color = isError ? "#ef4444" : "#94a3b8";
+    }
+
     // ---- Upload ----
 
-    // File identity: sha256 of the per-chunk digests, concatenated in order and
-    // hashed again (sha256-chunked-v1). SubtleCrypto cannot hash a stream, so
-    // hashing the file as a whole would mean holding all of it in memory; each
-    // chunk is hashed on its own instead, which keeps memory bounded.
-    async function chunkDigest(blob) {
-      const bytes = new Uint8Array(await blob.arrayBuffer());
-      const digest = await crypto.subtle.digest("SHA-256", bytes);
-      return Array.from(new Uint8Array(digest))
-        .map(function(b) { return b.toString(16).padStart(2, "0"); })
-        .join("");
-    }
-
-    async function contentHashOf(parts) {
-      const joined = new TextEncoder().encode(parts.join(""));
-      const digest = await crypto.subtle.digest("SHA-256", joined);
-      return Array.from(new Uint8Array(digest))
-        .map(function(b) { return b.toString(16).padStart(2, "0"); })
-        .join("");
-    }
+    // No client-side hashing: the file's identity is derived by the server
+    // from the chunk ids, so there is nothing to compute here.
 
     function randomUploadId() {
       const bytes = new Uint8Array(16);
@@ -617,7 +614,9 @@ jq -n --arg name "$(basename "\${FILE_PATH}")" --argjson size "$SIZE" \\
         try {
           const res = await fetch(
             uploadURL + "/chunks?upload_id=" + uploadId + "&index=" + index + "&total=" + total,
-            { method: "POST", body: blob, headers: { "Content-Type": "application/octet-stream" } }
+            { method: "POST", body: blob,
+              // Merged so the Authorization header rides along with the type.
+              headers: authHeaders({ "Content-Type": "application/octet-stream" }) }
           );
           const json = await res.json().catch(function() { return null; });
           if (res.ok && json && json.code === 0) return json.data;
@@ -645,19 +644,12 @@ jq -n --arg name "$(basename "\${FILE_PATH}")" --argjson size "$SIZE" \\
       entry.progressText = "0 / " + total + " chunks";
       renderQueue();
 
-      // Digests are computed up front so the content hash is known before any
-      // bytes go out; chunks here are File slices, not buffers, so nothing is
-      // held in memory beyond the chunk being hashed.
+      // Chunks are File slices, not buffers, so the browser never holds more
+      // than the slice currently in flight.
       const blobs = [];
       for (let i = 0; i < total; i++) {
         blobs.push(file.slice(i * CHUNK_SIZE, Math.min(file.size, (i + 1) * CHUNK_SIZE)));
       }
-
-      const digests = new Array(total);
-      for (let i = 0; i < total; i++) {
-        digests[i] = await chunkDigest(blobs[i]);
-      }
-      const contentHash = await contentHashOf(digests);
 
       // Chunks are independent (blobs attach to no ref), so a few can be in
       // flight at once; the commit only happens at /complete.
@@ -669,12 +661,9 @@ jq -n --arg name "$(basename "\${FILE_PATH}")" --argjson size "$SIZE" \\
           const i = next++;
           if (i >= total) return;
           const data = await sendChunk(blobs[i], uploadId, i + 1, total, entry);
-          results[i] = {
-            // The server renames chunks from the file id it derives, so only
-            // the digests and blob shas need to come back.
-            sha256: data.sha256,
-            blob_sha: data.blob_sha
-          };
+          // Only the id matters; the server derives the file's identity and
+          // names from it, so the client sends nothing it cannot verify.
+          results[i] = data.blob_sha;
           done += 1;
           entry.progress = Math.round((done / total) * 100);
           entry.progressText = done + " / " + total + " chunks";
@@ -685,13 +674,12 @@ jq -n --arg name "$(basename "\${FILE_PATH}")" --argjson size "$SIZE" \\
 
       const res = await fetch(uploadURL + "/complete", {
         method: "POST",
-        headers: { "Content-Type": "application/json" },
+        headers: authHeaders({ "Content-Type": "application/json" }),
         body: JSON.stringify({
           original_name: file.name,
           size: file.size,
           total_chunks: total,
           content_type: file.type || "application/octet-stream",
-          content_hash: contentHash,
           chunks: results
         })
       });
@@ -705,7 +693,7 @@ jq -n --arg name "$(basename "\${FILE_PATH}")" --argjson size "$SIZE" \\
     async function uploadSingle(entry) {
       const formData = new FormData();
       formData.append("file", entry.file);
-      const res = await fetch(uploadURL, { method: "POST", body: formData });
+      const res = await fetch(uploadURL, { method: "POST", body: formData, headers: authHeaders() });
       const json = await res.json().catch(function() { return null; });
       if (!res.ok || !json || json.code !== 0 || !json.data) {
         throw new Error(parseError(json, res.status));
@@ -763,7 +751,9 @@ jq -n --arg name "$(basename "\${FILE_PATH}")" --argjson size "$SIZE" \\
     // ---- Clear repo ----
     document.getElementById("btnClearRepo").addEventListener("click", async function() {
       try {
-        await fetch(apiBaseURL + "/api/v1/clear");
+        // Must be a POST now: a GET that wipes the repository can be triggered by
+      // any page the operator happens to visit.
+      await fetch(apiBaseURL + "/api/v1/clear", { method: "POST", headers: authHeaders() });
         loadFileList();
       } catch (e) {
         console.error("Error clearing:", e);
@@ -772,6 +762,19 @@ jq -n --arg name "$(basename "\${FILE_PATH}")" --argjson size "$SIZE" \\
     });
 
     // ---- Init ----
+    var tokenInput = document.getElementById("tokenInput");
+    tokenInput.value = getToken();
+    if (!getToken()) {
+      setTokenNote("required to upload", true);
+    }
+    tokenInput.addEventListener("input", function() {
+      try {
+        if (this.value) localStorage.setItem(TOKEN_KEY, this.value);
+        else localStorage.removeItem(TOKEN_KEY);
+      } catch (e) { /* storage may be unavailable; the field still works */ }
+      setTokenNote(this.value ? "saved" : "required to upload", !this.value);
+    });
+
     loadConfig().then(loadFileList);
   </script>
 </body>

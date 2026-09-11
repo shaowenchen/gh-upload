@@ -28,8 +28,10 @@ export interface ChunkManifestPart {
   index: number;
   name: string;
   size: number;
-  sha256: string;
-  /** Git blob sha for this chunk, so a download can fetch it directly. */
+  /**
+   * Git blob id of this chunk. Identifies the content and lets a download fetch
+   * it directly, without walking the tree per chunk.
+   */
   blob_sha: string;
 }
 
@@ -60,27 +62,33 @@ export function sha256Hex(data: Buffer | string): string {
 }
 
 /**
- * How a file's content_hash is built.
+ * How a stored file's content_hash is derived.
  *
- * A browser cannot hash a file incrementally — SubtleCrypto has no streaming
- * API — so hashing the whole file would mean holding all of it in memory, which
- * defeats the point of chunked upload. Instead each chunk is hashed on its own
- * (bounded memory), and the file digest is the sha256 of those digests
- * concatenated in order. That is deterministic and content-addressed, which is
- * all an upload id needs; it is deliberately not the sha256 of the file bytes,
- * and the manifest records which algorithm produced it.
+ * The digest is taken over the ordered git blob ids of the chunks rather than
+ * over the file bytes. Clients therefore never hash the file — which matters
+ * because a browser cannot hash a stream, so hashing the whole file would mean
+ * buffering all of it, defeating the point of chunked upload.
+ *
+ * It is deterministic and content-addressed (git blob ids are) but it is
+ * deliberately NOT the sha256 of the file, and the manifest says which
+ * algorithm produced it.
  */
-export const HASH_ALGORITHM = "sha256-chunked-v1";
+export const HASH_ALGORITHM = "sha256-git-blob-ids-v1";
+
+/** Stable identity for a file, from the ordered blob ids of its chunks. */
+export function contentHashFromBlobs(blobShas: string[]): string {
+  return sha256Hex(blobShas.join(""));
+}
 
 /**
  * Derive the stored file's id from its content hash, truncated to 32 hex chars.
  *
- * Because the id is content-addressed, a client retrying the same file
- * addresses the same chunk paths instead of scattering duplicates, and chunks of
+ * Because the id is content-addressed, uploading the same file twice addresses
+ * the same chunk paths instead of scattering duplicates, and chunks of
  * identical content resolve to the same git blob without a second write.
  */
-export function fileIdFromContentHash(contentSha256: string): string {
-  return contentSha256.substring(0, UPLOAD_ID_LENGTH);
+export function fileIdFromContentHash(contentHash: string): string {
+  return contentHash.substring(0, UPLOAD_ID_LENGTH);
 }
 
 export function isValidUploadId(id: string): boolean {

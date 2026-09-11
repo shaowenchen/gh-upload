@@ -7,7 +7,9 @@ export const clearRouter = Router();
 
 clearRouter.use(adminAuth);
 
-clearRouter.get("/", async (_req, res) => {
+// A GET that deletes the repository can be triggered by any page the operator
+// visits in a browser, so require a POST and confirm intent.
+clearRouter.post("/", async (_req, res) => {
   const github = new GitHubService();
   try {
     const repo = await github.getOrCreateRepo();

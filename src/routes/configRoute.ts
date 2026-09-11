@@ -2,6 +2,7 @@ import { Router } from "express";
 import { showData } from "../utils/response.js";
 import { config } from "../config.js";
 import { CHUNK_SIZE } from "../utils/chunk.js";
+import { MAX_SIMPLE_UPLOAD } from "../utils/limits.js";
 
 export const configRouter = Router();
 
@@ -23,5 +24,8 @@ configRouter.get("/", (req, res) => {
     // Published so the browser slices at exactly the size the server and the
     // CDN edge accept, instead of hardcoding a copy that can drift.
     chunk_size: CHUNK_SIZE,
+    // A client needs this to pick between the single-request and chunked paths;
+    // sending something larger than it to POST /api/v1/files is rejected.
+    max_simple_upload: MAX_SIMPLE_UPLOAD,
   });
 });

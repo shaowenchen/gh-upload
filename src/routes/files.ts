@@ -19,19 +19,15 @@ import {
   partName,
   simpleStoragePath,
   HASH_ALGORITHM,
+  contentHashFromBlobs,
   MAX_CONCURRENT_CHUNKS,
   MAX_QUEUED_CHUNKS,
   type ChunkManifest,
 } from "../utils/chunk.js";
+import { MAX_SIMPLE_UPLOAD } from "../utils/limits.js";
+import { adminAuth } from "../middleware/adminAuth.js";
 
 const upload = multer({ dest: os.tmpdir() });
-
-/**
- * Largest file the single-request path accepts. Anything larger has to use the
- * chunked endpoints, because a bigger body is rejected at Cloudflare's edge
- * (413) before it reaches this process.
- */
-const MAX_SIMPLE_UPLOAD = CHUNK_SIZE;
 
 /** Manifests fetched concurrently while building the file list. */
 const LIST_CONCURRENCY = 8;
@@ -86,6 +82,7 @@ async function admitChunk(
 // chunk, making the limit below map 1:1 onto what Cloudflare measures.
 filesRouter.post(
   "/chunks",
+  adminAuth,
   admitChunk,
   express.raw({ type: "*/*", limit: CHUNK_SIZE + 1024 }),
   async (req, res) => {
@@ -154,13 +151,12 @@ filesRouter.post(
 // there is no assembled file object. This commits the chunk blobs (unreferenced
 // until now, hence invisible in the repo) together with the manifest that
 // describes their order, in a single commit.
-filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) => {
+filesRouter.post("/complete", adminAuth, express.json({ limit: "1mb" }), async (req, res) => {
   const body = req.body as Record<string, unknown>;
   const originalName =
     typeof body.original_name === "string" ? sanitizeFilename(body.original_name) : "";
   const size = Number(body.size);
   const totalChunks = Number(body.total_chunks);
-  const contentHash = String(body.content_hash ?? "");
   const rawChunks = Array.isArray(body.chunks) ? body.chunks : [];
 
   if (!originalName) {
@@ -175,21 +171,19 @@ filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) =
     showError(res, "chunks must cover every index of total_chunks", 400);
     return;
   }
-  if (!/^[a-f0-9]{64}$/.test(contentHash)) {
-    showError(res, "content_hash must be a 64-character hex digest", 400);
-    return;
-  }
-
-  // Clients send only the ordered digests; per-chunk sizes are deterministic
-  // from the total, so there is no reason to make callers restate them (and a
-  // caller that gets them wrong produces a corrupt file).
+  // Each entry may be the blob id on its own or an object carrying it, so a
+  // client that has only the ids (a shell script) and one that has the whole
+  // response (the browser) can both post what they hold.
+  //
+  // Per-chunk sizes are not accepted from the client: they are deterministic
+  // from the total, and a caller that states them wrongly would produce a
+  // corrupt file rather than an error.
   const chunks = rawChunks.map((entry, i) => {
-    const c = (entry ?? {}) as Record<string, unknown>;
-    return {
-      index: i + 1,
-      sha256: String(c.sha256 ?? ""),
-      blob_sha: String(c.blob_sha ?? ""),
-    };
+    const blobSha =
+      typeof entry === "string"
+        ? entry
+        : String((entry as Record<string, unknown>)?.blob_sha ?? "");
+    return { index: i + 1, blob_sha: blobSha };
   });
 
   const shasOk = chunks.every((c) => /^[a-f0-9]{40}$/.test(c.blob_sha));
@@ -216,6 +210,10 @@ filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) =
     return;
   }
 
+  // Derived from the chunk identities rather than taken from the request: the
+  // caller has no reason to hash the file (and a browser cannot do so without
+  // buffering it), so requiring a digest only invited clients to get it wrong.
+  const contentHash = contentHashFromBlobs(chunks.map((c) => c.blob_sha));
   const fileId = fileIdFromContentHash(contentHash);
   const manifest: ChunkManifest = {
     version: 2,
@@ -232,7 +230,6 @@ filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) =
       // Recomputed rather than trusting the client's spelling of the name.
       name: partName(fileId, c.index, totalChunks),
       size: sizes[c.index - 1],
-      sha256: c.sha256,
       blob_sha: c.blob_sha,
     })),
     created_at: Math.floor(Date.now() / 1000),
@@ -270,7 +267,7 @@ filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) =
 });
 
 // POST /api/v1/files - Upload a whole file in one request
-filesRouter.post("/", upload.single("file"), async (req, res) => {
+filesRouter.post("/", adminAuth, upload.single("file"), async (req, res) => {
   const file = req.file;
   if (!file) {
     showError(res, "get form err: no file", 400);
@@ -299,9 +296,9 @@ filesRouter.post("/", upload.single("file"), async (req, res) => {
     showData(res, {
       name: originalName,
       size: file.size,
-      // Minor difference from the chunked path, which hashes chunk digests
-      // rather than file bytes: for a single-chunk file these coincide.
-      content_hash: sha256Hex(content),
+      // Same construction as the chunked path, so a one-chunk file has one
+      // identity regardless of which route carried it.
+      content_hash: contentHashFromBlobs([blobSha]),
       content_type: file.mimetype || "application/octet-stream",
       download_url: buildRawURL(repoPath),
     });
