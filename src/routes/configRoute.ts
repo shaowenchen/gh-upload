@@ -1,6 +1,7 @@
 import { Router } from "express";
 import { showData } from "../utils/response.js";
 import { config } from "../config.js";
+import { CHUNK_SIZE } from "../utils/chunk.js";
 
 export const configRouter = Router();
 
@@ -19,5 +20,8 @@ configRouter.get("/", (req, res) => {
   showData(res, {
     api_base_url: apiBaseURL,
     upload_url: `${apiBaseURL}/api/v1/files`,
+    // Published so the browser slices at exactly the size the server and the
+    // CDN edge accept, instead of hardcoding a copy that can drift.
+    chunk_size: CHUNK_SIZE,
   });
 });

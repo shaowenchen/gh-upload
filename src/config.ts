@@ -6,6 +6,8 @@ export interface Config {
     token: string;
     repo: string;
     branch: string;
+    /** REST API base; override for GitHub Enterprise. */
+    apiBase: string;
     commitEmail: string;
     commitName: string;
   };
@@ -21,6 +23,7 @@ function loadConfig(): Config {
       token: process.env.GITHUB_TOKEN || "",
       repo: process.env.GITHUB_REPO || "uploadbases/cdn0",
       branch: process.env.GITHUB_BRANCH || "raw",
+      apiBase: process.env.GITHUB_API_BASE || "https://api.github.com",
       commitEmail: process.env.GITHUB_COMMIT_EMAIL || "auto@auto.com",
       commitName: process.env.GITHUB_COMMIT_NAME || "none",
     },

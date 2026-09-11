@@ -1,9 +1,37 @@
 import { createHash } from "node:crypto";
-import { readFileSync, openSync, readSync, closeSync } from "node:fs";
-import * as path from "node:path";
-import { GitHubService } from "../services/github.js";
 
-export const CHUNK_SIZE = 50 * 1024 * 1024; // 50MB
+/**
+ * Chunk size used when splitting a file across requests.
+ *
+ * The CDN body limit (100MB on Cloudflare's lower plans) sets the ceiling; this
+ * sits far below it. It is not pushed higher because of the memory cost on the
+ * receiving end: writing a chunk to GitHub goes through base64 encoding and
+ * JSON serialization, which peaks at roughly 7x the chunk size per in-flight
+ * request. 16MB keeps a single chunk around 120MB of transient heap, so a few
+ * concurrent uploads still fit inside the pod's memory limit.
+ */
+export const CHUNK_SIZE = 16 * 1024 * 1024; // 16MB
+
+/**
+ * How many chunk bodies the server will process at once, and how many more it
+ * will let wait.
+ *
+ * The browser picks its own request concurrency, and several users upload at
+ * the same time, so without a bound here the process memory is a function of
+ * client behaviour. Requests beyond the queue limit are refused with a
+ * retryable 503 rather than accepted and allowed to exhaust memory.
+ */
+export const MAX_CONCURRENT_CHUNKS = 2;
+export const MAX_QUEUED_CHUNKS = 32;
+
+export interface ChunkManifestPart {
+  index: number;
+  name: string;
+  size: number;
+  sha256: string;
+  /** Git blob sha for this chunk, so a download can fetch it directly. */
+  blob_sha: string;
+}
 
 export interface ChunkManifest {
   version: number;
@@ -13,34 +41,62 @@ export interface ChunkManifest {
   size: number;
   chunk_size: number;
   total_chunks: number;
-  sha256: string;
+  /**
+   * File identity, derived from the chunk digests rather than by hashing the
+   * whole file. See hash_algorithm for the exact construction.
+   */
+  content_hash: string;
+  hash_algorithm: string;
   chunks: ChunkManifestPart[];
   created_at: number;
 }
 
-export interface ChunkManifestPart {
-  index: number;
-  name: string;
-  size: number;
-  sha256: string;
+const UPLOAD_ID_LENGTH = 32;
+const UPLOAD_ID_PATTERN = /^[a-f0-9]{32}$/;
+const TIMESTAMP_PREFIX_PATTERN = /^(\d{10})-(.+)$/;
+
+export function sha256Hex(data: Buffer | string): string {
+  return createHash("sha256").update(data).digest("hex");
 }
 
-export function buildFileID(originalName: string, size: number, createdAt: number): string {
-  const sum = createHash("sha256")
-    .update(`${originalName}:${size}:${createdAt}:${Date.now() * 1e6}`)
-    .digest("hex");
-  return sum.substring(0, 32);
+/**
+ * How a file's content_hash is built.
+ *
+ * A browser cannot hash a file incrementally — SubtleCrypto has no streaming
+ * API — so hashing the whole file would mean holding all of it in memory, which
+ * defeats the point of chunked upload. Instead each chunk is hashed on its own
+ * (bounded memory), and the file digest is the sha256 of those digests
+ * concatenated in order. That is deterministic and content-addressed, which is
+ * all an upload id needs; it is deliberately not the sha256 of the file bytes,
+ * and the manifest records which algorithm produced it.
+ */
+export const HASH_ALGORITHM = "sha256-chunked-v1";
+
+/**
+ * Derive the stored file's id from its content hash, truncated to 32 hex chars.
+ *
+ * Because the id is content-addressed, a client retrying the same file
+ * addresses the same chunk paths instead of scattering duplicates, and chunks of
+ * identical content resolve to the same git blob without a second write.
+ */
+export function fileIdFromContentHash(contentSha256: string): string {
+  return contentSha256.substring(0, UPLOAD_ID_LENGTH);
+}
+
+export function isValidUploadId(id: string): boolean {
+  return UPLOAD_ID_PATTERN.test(id);
 }
 
 export function sanitizeFilename(name: string): string {
-  name = path.basename(name);
-  name = name.replace(/\//g, "_").replace(/\\/g, "_");
-  if (name === "." || name === "") return "file";
-  return name;
+  const base = name.split(/[/\\]/).pop() || "";
+  const cleaned = base.replace(/[\x00-\x1f\x7f]/g, "").trim();
+  if (cleaned === "" || cleaned === "." || cleaned === "..") return "file";
+  return cleaned;
 }
 
 export function partName(fileId: string, index: number, total: number): string {
-  return `${fileId}.part.${String(index).padStart(6, "0")}-of-${String(total).padStart(6, "0")}`;
+  const width = Math.max(6, String(total).length);
+  return `${fileId}.part.${String(index).padStart(width, "0")}-of-${String(total).padStart(width, "0")}`;
 }
 
 export function manifestName(fileId: string): string {
@@ -55,96 +111,25 @@ export function isManifestName(name: string): boolean {
   return name.endsWith(".manifest.json");
 }
 
+/** Storage names this service creates itself, as opposed to user uploads. */
+export function isGeneratedName(name: string): boolean {
+  return isChunkPartName(name) || isManifestName(name);
+}
+
+/**
+ * Split a `<epoch>-<filename>` storage name back into its parts.
+ *
+ * The timestamp is matched as an anchored 10-digit prefix rather than "up to
+ * the first dash", so a file legitimately named `2024-report.pdf` is not
+ * misread as a timestamp and does not poison the sort order.
+ */
 export function splitTime(str: string): [number, string] {
-  const index = str.indexOf("-");
-  if (index === -1) return [0, str];
-  const timeStamp = parseInt(str.substring(0, index), 10) || 0;
-  return [timeStamp, str.substring(index + 1)];
+  const match = TIMESTAMP_PREFIX_PATTERN.exec(str);
+  if (!match) return [0, str];
+  return [parseInt(match[1], 10), match[2]];
 }
 
-export async function saveLargeFile(
-  github: GitHubService,
-  filePath: string,
-  originalName: string,
-  contentType: string,
-  size: number
-): Promise<ChunkManifest> {
-  const createdAt = Math.floor(Date.now() / 1000);
-  const fileId = buildFileID(originalName, size, createdAt);
-  const totalChunks = Math.ceil(size / CHUNK_SIZE);
-
-  const manifest: ChunkManifest = {
-    version: 1,
-    file_id: fileId,
-    original_name: originalName,
-    content_type: contentType,
-    size,
-    chunk_size: CHUNK_SIZE,
-    total_chunks: totalChunks,
-    sha256: "",
-    chunks: [],
-    created_at: createdAt,
-  };
-
-  const fd = openSync(filePath, "r");
-  const totalHash = createHash("sha256");
-  const buffer = Buffer.alloc(CHUNK_SIZE);
-
-  try {
-    for (let index = 1; index <= totalChunks; index++) {
-      const bytesRead = readSync(fd, buffer, 0, CHUNK_SIZE, (index - 1) * CHUNK_SIZE);
-      if (bytesRead === 0) break;
-
-      const chunk = buffer.subarray(0, bytesRead);
-      totalHash.update(chunk);
-      const chunkHash = createHash("sha256").update(chunk).digest("hex");
-
-      const part: ChunkManifestPart = {
-        index,
-        name: partName(fileId, index, totalChunks),
-        size: bytesRead,
-        sha256: chunkHash,
-      };
-
-      const result = await github.uploadContent(part.name, Buffer.from(chunk));
-      if (!result) throw new Error(`upload chunk ${part.name} failed`);
-
-      manifest.chunks.push(part);
-    }
-  } finally {
-    closeSync(fd);
-  }
-
-  manifest.sha256 = totalHash.digest("hex");
-
-  const manifestJson = JSON.stringify(manifest, null, 2);
-  const result = await github.uploadContent(manifestName(fileId), Buffer.from(manifestJson, "utf-8"));
-  if (!result) throw new Error(`upload manifest ${manifestName(fileId)} failed`);
-
-  return manifest;
-}
-
-export async function reassembleFile(
-  github: GitHubService,
-  repo: { name: string; defaultBranch: string },
-  manifest: ChunkManifest
-): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  const totalHash = createHash("sha256");
-
-  for (const part of manifest.chunks) {
-    const content = await github.downloadFile(repo, part.name);
-    const partHash = createHash("sha256").update(content).digest("hex");
-    if (partHash !== part.sha256) {
-      throw new Error("chunk checksum mismatch");
-    }
-    chunks.push(content);
-    totalHash.update(content);
-  }
-
-  const assembled = Buffer.concat(chunks);
-  if (totalHash.digest("hex") !== manifest.sha256) {
-    throw new Error("file checksum mismatch");
-  }
-  return assembled;
+/** Storage path for a single-request upload. */
+export function simpleStoragePath(originalName: string, now: number): string {
+  return `${Math.floor(now / 1000)}-${originalName}`;
 }

@@ -4,9 +4,27 @@ import { Buffer } from "node:buffer";
 
 const [REPO_OWNER, REPO_NAME] = config.github.repo.split("/");
 
-interface RepoInfo {
+/** How long to trust a cached repo lookup before hitting the API again. */
+const REPO_CACHE_TTL_MS = 60_000;
+
+/** Attempts to land a commit before giving up on ref contention. */
+const COMMIT_MAX_ATTEMPTS = 5;
+
+export interface RepoInfo {
   name: string;
   defaultBranch: string;
+}
+
+export interface FileToCommit {
+  path: string;
+  /** Blob sha returned by createBlob. */
+  sha: string;
+}
+
+export interface TreeEntry {
+  path: string;
+  sha: string;
+  size: number;
 }
 
 export class GitHubService {
@@ -15,9 +33,14 @@ export class GitHubService {
   private commitEmail: string;
   private commitName: string;
   private isOrg: boolean | null = null;
+  private repoPromise: Promise<RepoInfo> | null = null;
+  private repoCachedAt = 0;
 
   constructor() {
-    this.octokit = new Octokit({ auth: config.github.token });
+    this.octokit = new Octokit({
+      auth: config.github.token,
+      baseUrl: config.github.apiBase,
+    });
     this.branch = config.github.branch;
     this.commitEmail = config.github.commitEmail;
     this.commitName = config.github.commitName;
@@ -34,9 +57,27 @@ export class GitHubService {
     return this.isOrg;
   }
 
+  /**
+   * Resolve the target repo, caching the result briefly. A chunked upload makes
+   * many calls in quick succession, and each one re-running the org probe and
+   * repo lookup costs two API requests for an answer that cannot have changed.
+   */
   async getOrCreateRepo(): Promise<RepoInfo> {
-    const isOrg = await this.checkIsOrg();
+    const fresh =
+      this.repoPromise !== null && Date.now() - this.repoCachedAt < REPO_CACHE_TTL_MS;
+    if (fresh) return this.repoPromise as Promise<RepoInfo>;
 
+    this.repoCachedAt = Date.now();
+    this.repoPromise = this.resolveRepo().catch((err) => {
+      // Never cache a failure — let the next caller retry.
+      this.repoPromise = null;
+      throw err;
+    });
+    return this.repoPromise;
+  }
+
+  private async resolveRepo(): Promise<RepoInfo> {
+    const isOrg = await this.checkIsOrg();
     try {
       const { data: repo } = await this.octokit.rest.repos.get({
         owner: REPO_OWNER,
@@ -63,100 +104,172 @@ export class GitHubService {
     return { name: repo.name, defaultBranch: repo.default_branch };
   }
 
-  async getBranchSize(repo: RepoInfo, branch: string): Promise<number> {
-    try {
-      await this.octokit.rest.repos.getBranch({
-        owner: REPO_OWNER,
-        repo: repo.name,
-        branch,
-      });
-      const { data: contents } = await this.octokit.rest.repos.getContent({
-        owner: REPO_OWNER,
-        repo: repo.name,
-        path: "",
-        ref: branch,
-      });
-      if (Array.isArray(contents)) {
-        return contents.reduce((sum, c) => (c.type === "file" ? sum + c.size : sum), 0);
-      }
-      return 0;
-    } catch {
-      // Branch doesn't exist, create it from default branch
-      const defaultBranch = repo.defaultBranch || "main";
-      const { data: branchRef } = await this.octokit.rest.repos.getBranch({
-        owner: REPO_OWNER,
-        repo: repo.name,
-        branch: defaultBranch,
-      });
-      await this.octokit.rest.git.createRef({
-        owner: REPO_OWNER,
-        repo: repo.name,
-        ref: `refs/heads/${branch}`,
-        sha: branchRef.commit.sha,
-      });
-      return 0;
-    }
-  }
-
-  async listFiles(repo: RepoInfo) {
-    try {
-      const { data: contents } = await this.octokit.rest.repos.getContent({
-        owner: REPO_OWNER,
-        repo: repo.name,
-        path: "",
-        ref: this.branch,
-      });
-      return Array.isArray(contents) ? contents : [];
-    } catch {
-      return [];
-    }
-  }
-
-  async uploadContent(repoPath: string, content: Buffer): Promise<string> {
+  /**
+   * Write a blob and return its sha.
+   *
+   * Blobs are content-addressed and attach to no ref, so chunks can be uploaded
+   * concurrently without contending for the branch ref — and re-sending a chunk
+   * of identical content resolves to the same object instead of a second write.
+   * Only commitFiles touches the ref.
+   */
+  async createBlob(content: Buffer): Promise<string> {
     const repo = await this.getOrCreateRepo();
-    await this.octokit.rest.repos.createOrUpdateFileContents({
+    const { data } = await this.octokit.rest.git.createBlob({
       owner: REPO_OWNER,
       repo: repo.name,
-      path: repoPath,
-      message: this.commitName,
       content: content.toString("base64"),
-      branch: this.branch,
-      committer: { name: this.commitName, email: this.commitEmail },
+      encoding: "base64",
     });
-    return `${REPO_OWNER}/${repo.name}/${this.branch}/${repoPath}`;
+    return data.sha;
   }
 
-  async downloadFile(repo: RepoInfo, fileName: string): Promise<Buffer> {
-    const { data } = await this.octokit.rest.repos.getContent({
+  /**
+   * Read a blob by sha. Preferred over path lookups for chunk reads: the
+   * manifest already carries each chunk's blob sha, so streaming a file needs
+   * no tree walks at all.
+   */
+  async getBlob(sha: string): Promise<Buffer> {
+    const repo = await this.getOrCreateRepo();
+    const { data } = await this.octokit.rest.git.getBlob({
       owner: REPO_OWNER,
       repo: repo.name,
-      path: fileName,
-      ref: this.branch,
+      file_sha: sha,
     });
-    // Single file response
-    if (!Array.isArray(data) && "content" in data && data.content) {
-      return Buffer.from(data.content, "base64");
+    return Buffer.from(data.content, "base64");
+  }
+
+  /**
+   * Every blob in a tree, keyed by path.
+   *
+   * Uses the recursive tree endpoint rather than the Contents API, which caps
+   * its listing at roughly a thousand entries and returns nothing for the rest.
+   * Callers that need several paths fetch this once and index into it.
+   */
+  async getTreeEntries(treeSha: string): Promise<Map<string, TreeEntry>> {
+    const repo = await this.getOrCreateRepo();
+    const { data } = await this.octokit.rest.git.getTree({
+      owner: REPO_OWNER,
+      repo: repo.name,
+      tree_sha: treeSha,
+      recursive: "1",
+    });
+
+    const map = new Map<string, TreeEntry>();
+    for (const entry of data.tree) {
+      if (entry.type !== "blob" || !entry.path || !entry.sha) continue;
+      map.set(entry.path, { path: entry.path, sha: entry.sha, size: entry.size ?? 0 });
     }
-    throw new Error(`Not a file: ${fileName}`);
+    return map;
   }
 
-  async deleteFile(repo: RepoInfo, path: string): Promise<void> {
-    const { data: file } = await this.octokit.rest.repos.getContent({
-      owner: REPO_OWNER,
-      repo: repo.name,
-      path,
-      ref: this.branch,
-    });
-    if (Array.isArray(file) || !("sha" in file)) return;
-    await this.octokit.rest.repos.deleteFile({
-      owner: REPO_OWNER,
-      repo: repo.name,
-      path,
-      message: `Delete file ${path}`,
-      sha: file.sha,
-      branch: this.branch,
-      committer: { name: this.commitName, email: this.commitEmail },
-    });
+  /** Head tree sha of the target branch, or null if the branch has no commits. */
+  async getBranchTreeSha(repo: RepoInfo): Promise<string | null> {
+    const head = await this.getBranchHead(repo);
+    return head ? head.treeSha : null;
+  }
+
+  /** Read one file by path, given a tree sha the caller already holds. */
+  async getFileContent(treeSha: string, path: string): Promise<Buffer> {
+    const entries = await this.getTreeEntries(treeSha);
+    const entry = entries.get(path);
+    if (!entry) throw new Error(`file not found: ${path}`);
+    return this.getBlob(entry.sha);
+  }
+
+  private async getBranchHead(
+    repo: RepoInfo
+  ): Promise<{ commitSha: string; treeSha: string } | null> {
+    try {
+      const { data: ref } = await this.octokit.rest.git.getRef({
+        owner: REPO_OWNER,
+        repo: repo.name,
+        ref: `heads/${this.branch}`,
+      });
+      const { data: commit } = await this.octokit.rest.git.getCommit({
+        owner: REPO_OWNER,
+        repo: repo.name,
+        commit_sha: ref.object.sha,
+      });
+      return { commitSha: ref.object.sha, treeSha: commit.tree.sha };
+    } catch {
+      // Branch (or repo) does not exist yet.
+      return null;
+    }
+  }
+
+  /**
+   * Commit a set of already-uploaded blobs in one atomic operation.
+   *
+   * One tree + one commit + one ref update means a partial upload can never
+   * leave stray files behind. The ref update is a compare-and-swap: if a
+   * concurrent writer moved the branch, GitHub rejects it (force:false) and we
+   * re-read the head and replay, rather than silently clobbering their commit.
+   */
+  async commitFiles(files: FileToCommit[], message: string): Promise<string> {
+    if (files.length === 0) throw new Error("nothing to commit");
+    const repo = await this.getOrCreateRepo();
+
+    for (let attempt = 1; attempt <= COMMIT_MAX_ATTEMPTS; attempt++) {
+      const head = await this.getBranchHead(repo);
+
+      const { data: tree } = await this.octokit.rest.git.createTree({
+        owner: REPO_OWNER,
+        repo: repo.name,
+        ...(head ? { base_tree: head.treeSha } : {}),
+        tree: files.map((f) => ({
+          path: f.path,
+          mode: "100644" as const,
+          type: "blob" as const,
+          sha: f.sha,
+        })),
+      });
+
+      const { data: commit } = await this.octokit.rest.git.createCommit({
+        owner: REPO_OWNER,
+        repo: repo.name,
+        message,
+        tree: tree.sha,
+        ...(head ? { parents: [head.commitSha] } : {}),
+        author: { name: this.commitName, email: this.commitEmail },
+        committer: { name: this.commitName, email: this.commitEmail },
+      });
+
+      if (!head) {
+        // First commit on this branch — create the ref at it. A racing creator
+        // makes this fail, which the catch below retries as an update.
+        try {
+          await this.octokit.rest.git.createRef({
+            owner: REPO_OWNER,
+            repo: repo.name,
+            ref: `refs/heads/${this.branch}`,
+            sha: commit.sha,
+          });
+          return commit.sha;
+        } catch (err) {
+          if (attempt === COMMIT_MAX_ATTEMPTS) throw err;
+          continue;
+        }
+      }
+
+      try {
+        await this.octokit.rest.git.updateRef({
+          owner: REPO_OWNER,
+          repo: repo.name,
+          ref: `heads/${this.branch}`,
+          sha: commit.sha,
+          force: false,
+        });
+        return commit.sha;
+      } catch (err) {
+        const status = (err as { status?: number }).status;
+        // 422/409 = the ref moved under us; re-read the head and replay.
+        const retryable = status === 422 || status === 409;
+        if (retryable && attempt < COMMIT_MAX_ATTEMPTS) continue;
+        throw err;
+      }
+    }
+
+    throw new Error("commit failed after retries: branch ref kept moving");
   }
 
   async deleteRepo(repo: RepoInfo): Promise<void> {

@@ -63,11 +63,27 @@
     .file-queue { margin-top: 16px; }
     .file-queue-item {
       display: flex; align-items: center; justify-content: space-between;
+      flex-wrap: wrap; gap: 6px 0;
       padding: 10px 14px; background: #fff; border-radius: 8px;
       margin-bottom: 8px; box-shadow: 0 1px 3px rgba(0,0,0,0.08);
     }
     .file-queue-item .name { flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 14px; }
     .file-queue-item .size { margin: 0 12px; font-size: 12px; color: #888; white-space: nowrap; }
+    /* Full-width second row inside the flex item, so the bar spans the card. */
+    .file-queue-item .progress {
+      flex-basis: 100%; display: none; align-items: center; gap: 8px; margin-top: 2px;
+    }
+    .file-queue-item.uploading .progress { display: flex; }
+    .file-queue-item .progress-track {
+      flex: 1; height: 4px; background: #e2e8f0; border-radius: 999px; overflow: hidden;
+    }
+    .file-queue-item .progress-bar {
+      height: 100%; width: 0; background: #0d6ffd; border-radius: 999px;
+      transition: width 0.15s linear;
+    }
+    .file-queue-item .progress-text {
+      font-size: 11px; color: #64748b; white-space: nowrap; font-variant-numeric: tabular-nums;
+    }
     .file-queue-item .status { font-size: 12px; white-space: nowrap; }
     .file-queue-item .status.success { color: #10b981; }
     .file-queue-item .status.error { color: #ef4444; }
@@ -291,7 +307,7 @@
       <summary class="script-summary">
         <div class="script-title">
           <h3>CLI Upload</h3>
-          <p>Set the file path, then upload it directly. Large files are split by the server automatically.</p>
+          <p>Set the file path, then upload it directly. Files larger than one chunk are split in the shell and sent piecewise, because a single larger body is rejected at the CDN edge.</p>
         </div>
       </summary>
       <div class="script-content">
@@ -323,6 +339,16 @@
     let currentFilePage = 1;
     const filesPerPage = 8;
 
+    // Overwritten from /api/v1/config so the slice size always matches what the
+    // server and the CDN edge accept.
+    let CHUNK_SIZE = 32 * 1024 * 1024;
+    // Chunks in flight at once. Blobs are content-addressed and attach to no
+    // ref, so concurrent chunk uploads cannot conflict with each other; the
+    // server also gates how many it processes, and answers 503 when saturated,
+    // which the retry below backs off from.
+    const CHUNK_CONCURRENCY = 2;
+    const CHUNK_MAX_RETRIES = 3;
+
     // ---- Helpers ----
     function humanSize(bytes) {
       if (bytes == null) return "-";
@@ -343,6 +369,9 @@
         if (json.data && json.data.upload_url) {
           uploadURL = json.data.upload_url;
         }
+        if (json.data && json.data.chunk_size) {
+          CHUNK_SIZE = json.data.chunk_size;
+        }
         updateScript();
       } catch (e) {
         console.error("Error loading config:", e);
@@ -350,11 +379,43 @@
     }
 
     function updateScript() {
-      const script = [
-        "FILE_PATH=\"/path/to/file\"",
-        "",
-        "curl -sS -F \"file=@${FILE_PATH}\" \"" + apiBaseURL + "/api/v1/files\""
-      ].join("\n");
+      // Shell var references are escaped (\${...}) so the template literal only
+      // interpolates the values this function actually supplies.
+      const script = `FILE_PATH="/path/to/file"
+CHUNK=${CHUNK_SIZE}
+
+SIZE=$(stat -f%z "$FILE_PATH" 2>/dev/null || stat -c%s "$FILE_PATH")
+
+# A file that fits in one chunk goes up in a single request.
+if [ "$SIZE" -le "$CHUNK" ]; then
+  curl -sS -F "file=@\${FILE_PATH}" "${apiBaseURL}/api/v1/files"
+  exit $?
+fi
+
+# Anything larger has to be split here, because a single body of that size is
+# rejected by the CDN edge (413) before it ever reaches the server.
+TOTAL=$(( (SIZE + CHUNK - 1) / CHUNK ))
+UPLOAD_ID=$(head -c 32 /dev/urandom | od -An -tx1 | tr -d " \\n" | cut -c1-32)
+
+CHUNKS="[]"
+for I in $(seq 1 "$TOTAL"); do
+  RESP=$(dd if="\${FILE_PATH}" bs="$CHUNK" skip=$((I - 1)) count=1 2>/dev/null \\
+    | curl -sS --data-binary @- \\
+        "${apiBaseURL}/api/v1/files/chunks?upload_id=\${UPLOAD_ID}&index=\${I}&total=\${TOTAL}" \\
+        -H "Content-Type: application/octet-stream")
+  CHUNKS=$(printf '%s' "$CHUNKS" | jq -c --argjson r "$RESP" '. + [$r.data]')
+done
+
+# File identity is the sha256 of the chunk digests concatenated in order
+# (sha256-chunked-v1) — see hash_algorithm in the manifest.
+CONTENT_HASH=$(printf '%s' "$CHUNKS" | jq -r 'map(.sha256) | join("")' \\
+  | shasum -a 256 | cut -d" " -f1)
+
+jq -n --arg name "$(basename "\${FILE_PATH}")" --argjson size "$SIZE" \\
+      --argjson total "$TOTAL" --arg hash "$CONTENT_HASH" --argjson chunks "$CHUNKS" \\
+      '{original_name: $name, size: $size, total_chunks: $total, content_hash: $hash, chunks: $chunks}' \\
+| curl -sS -X POST "${apiBaseURL}/api/v1/files/complete" \\
+    -H "Content-Type: application/json" --data-binary @-`;
       document.getElementById("uploadScript").textContent = script;
     }
 
@@ -448,7 +509,12 @@
     }
 
     function escapeAttr(s) {
-      return s.replace(/"/g, "&quot;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/"/g, "&quot;")
+        .replace(/'/g, "&#39;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;");
     }
 
     // ---- File Queue UI ----
@@ -471,7 +537,10 @@
 
     function addFiles(fileList) {
       for (var i = 0; i < fileList.length; i++) {
-        selectedFiles.push({ file: fileList[i], status: "pending", url: null });
+        selectedFiles.push({
+          file: fileList[i], status: "pending", url: null,
+          progress: 0, progressText: "", lastError: ""
+        });
       }
       renderQueue();
     }
@@ -481,6 +550,9 @@
         var statusClass = entry.status === "error" ? "error" : entry.status === "uploading" ? "uploading" : "success";
         var statusText = entry.status === "pending" ? "Waiting" : entry.status === "uploading" ? "Uploading..." :
                          entry.status === "error" ? "Failed" : "Done";
+        // Keep the reason reachable without widening the row.
+        var statusTitle = entry.status === "error" && entry.lastError
+          ? ' title="' + escapeAttr(entry.lastError) + '"' : "";
         var copyBtn = entry.url ? '<button class="copy-btn" data-idx="' + idx + '">Copy</button>' : "";
         return '<div class="file-queue-item"><span class="name">' + escapeHtml(entry.file.name) +
                '</span><span class="size">' + humanSize(entry.file.size) +
@@ -504,32 +576,182 @@
       renderQueue();
     });
 
+    // ---- Upload ----
+
+    // File identity: sha256 of the per-chunk digests, concatenated in order and
+    // hashed again (sha256-chunked-v1). SubtleCrypto cannot hash a stream, so
+    // hashing the file as a whole would mean holding all of it in memory; each
+    // chunk is hashed on its own instead, which keeps memory bounded.
+    async function chunkDigest(blob) {
+      const bytes = new Uint8Array(await blob.arrayBuffer());
+      const digest = await crypto.subtle.digest("SHA-256", bytes);
+      return Array.from(new Uint8Array(digest))
+        .map(function(b) { return b.toString(16).padStart(2, "0"); })
+        .join("");
+    }
+
+    async function contentHashOf(parts) {
+      const joined = new TextEncoder().encode(parts.join(""));
+      const digest = await crypto.subtle.digest("SHA-256", joined);
+      return Array.from(new Uint8Array(digest))
+        .map(function(b) { return b.toString(16).padStart(2, "0"); })
+        .join("");
+    }
+
+    function randomUploadId() {
+      const bytes = new Uint8Array(16);
+      crypto.getRandomValues(bytes);
+      return Array.from(bytes).map(function(b) {
+        return b.toString(16).padStart(2, "0");
+      }).join("");
+    }
+
+    function parseError(json, status) {
+      if (json && json.msg) return json.msg;
+      return "HTTP " + status;
+    }
+
+    /** POST one chunk, retrying transient failures with a short backoff. */
+    async function sendChunk(blob, uploadId, index, total, entry) {
+      for (let attempt = 0; attempt <= CHUNK_MAX_RETRIES; attempt++) {
+        try {
+          const res = await fetch(
+            uploadURL + "/chunks?upload_id=" + uploadId + "&index=" + index + "&total=" + total,
+            { method: "POST", body: blob, headers: { "Content-Type": "application/octet-stream" } }
+          );
+          const json = await res.json().catch(function() { return null; });
+          if (res.ok && json && json.code === 0) return json.data;
+          // 4xx other than 408/429 means retrying cannot help.
+          if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
+            throw new Error(parseError(json, res.status));
+          }
+          entry.lastError = parseError(json, res.status);
+        } catch (e) {
+          entry.lastError = e.message || String(e);
+        }
+        if (attempt < CHUNK_MAX_RETRIES) {
+          await new Promise(function(r) { setTimeout(r, 500 * Math.pow(2, attempt)); });
+        }
+      }
+      throw new Error(entry.lastError || "chunk upload failed");
+    }
+
+    async function uploadInChunks(entry) {
+      const file = entry.file;
+      const total = Math.ceil(file.size / CHUNK_SIZE);
+      const uploadId = randomUploadId();
+
+      entry.progress = 0;
+      entry.progressText = "0 / " + total + " chunks";
+      renderQueue();
+
+      // Digests are computed up front so the content hash is known before any
+      // bytes go out; chunks here are File slices, not buffers, so nothing is
+      // held in memory beyond the chunk being hashed.
+      const blobs = [];
+      for (let i = 0; i < total; i++) {
+        blobs.push(file.slice(i * CHUNK_SIZE, Math.min(file.size, (i + 1) * CHUNK_SIZE)));
+      }
+
+      const digests = new Array(total);
+      for (let i = 0; i < total; i++) {
+        digests[i] = await chunkDigest(blobs[i]);
+      }
+      const contentHash = await contentHashOf(digests);
+
+      // Chunks are independent (blobs attach to no ref), so a few can be in
+      // flight at once; the commit only happens at /complete.
+      const results = new Array(total);
+      let done = 0;
+      let next = 0;
+      const workers = new Array(Math.min(CHUNK_CONCURRENCY, total)).fill(0).map(async function() {
+        for (;;) {
+          const i = next++;
+          if (i >= total) return;
+          const data = await sendChunk(blobs[i], uploadId, i + 1, total, entry);
+          results[i] = {
+            // The server renames chunks from the file id it derives, so only
+            // the digests and blob shas need to come back.
+            sha256: data.sha256,
+            blob_sha: data.blob_sha
+          };
+          done += 1;
+          entry.progress = Math.round((done / total) * 100);
+          entry.progressText = done + " / " + total + " chunks";
+          renderQueue();
+        }
+      });
+      await Promise.all(workers);
+
+      const res = await fetch(uploadURL + "/complete", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          original_name: file.name,
+          size: file.size,
+          total_chunks: total,
+          content_type: file.type || "application/octet-stream",
+          content_hash: contentHash,
+          chunks: results
+        })
+      });
+      const json = await res.json().catch(function() { return null; });
+      if (!res.ok || !json || json.code !== 0 || !json.data) {
+        throw new Error(parseError(json, res.status));
+      }
+      return json.data.download_url;
+    }
+
+    async function uploadSingle(entry) {
+      const formData = new FormData();
+      formData.append("file", entry.file);
+      const res = await fetch(uploadURL, { method: "POST", body: formData });
+      const json = await res.json().catch(function() { return null; });
+      if (!res.ok || !json || json.code !== 0 || !json.data) {
+        throw new Error(parseError(json, res.status));
+      }
+      return json.data.download_url;
+    }
+
     btnUpload.addEventListener("click", async function() {
       var pending = selectedFiles.filter(function(e) { return e.status === "pending" || e.status === "error"; });
       if (pending.length === 0) return;
 
+      btnUpload.disabled = true;
+      var failed = 0;
+
       for (var entry of pending) {
         entry.status = "uploading";
+        entry.lastError = "";
         renderQueue();
-
-        var formData = new FormData();
-        formData.append("file", entry.file);
-
         try {
-          var res = await fetch(uploadURL, { method: "POST", body: formData });
-          var json = await res.json();
-          if (json.code === 0 && json.data && json.data.download_url) {
-            entry.status = "success";
-            entry.url = json.data.download_url;
-          } else {
-            entry.status = "error";
-          }
+          // Small files skip the chunk protocol entirely rather than paying
+          // for a hashing pass and extra round trips.
+          entry.url = entry.file.size <= CHUNK_SIZE
+            ? await uploadSingle(entry)
+            : await uploadInChunks(entry);
+          entry.status = "success";
+          entry.progress = 100;
+          entry.progressText = "";
         } catch (e) {
           entry.status = "error";
+          entry.lastError = e.message || String(e);
         }
         renderQueue();
       }
+
+      failed = pending.filter(function(e) { return e.status === "error"; }).length;
+      btnUpload.disabled = false;
       loadFileList();
+      if (failed > 0) {
+        // Report the failures rather than leaving the user to notice the red
+        // "Failed" label, and name each one to make a retry actionable.
+        var detail = pending
+          .filter(function(e) { return e.status === "error"; })
+          .map(function(e) { return e.file.name + ": " + (e.lastError || "unknown error"); })
+          .join("\n");
+        alert(failed + " file(s) failed to upload:\n\n" + detail);
+      }
     });
 
     // ---- Script copy ----
