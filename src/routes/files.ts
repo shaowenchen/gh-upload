@@ -39,6 +39,24 @@ import { signPath, verifyPath } from "../utils/signing.js";
 const PREVIEWABLE =
   /^(image\/(png|jpeg|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)|video\/(mp4|webm|ogg)|audio\/(mpeg|mp4|ogg|wav|webm)|application\/(pdf|json)|text\/(?!html$|xml$))/;
 
+/** MIME by extension, for files uploaded with no type (upload.sh sends none). */
+const BY_EXT: Record<string, string> = {
+  png: "image/png", jpg: "image/jpeg", jpeg: "image/jpeg", gif: "image/gif",
+  webp: "image/webp", avif: "image/avif", bmp: "image/bmp", ico: "image/x-icon",
+  mp4: "video/mp4", webm: "video/webm", ogv: "video/ogg",
+  mp3: "audio/mpeg", m4a: "audio/mp4", ogg: "audio/ogg", wav: "audio/wav",
+  pdf: "application/pdf", json: "application/json",
+  txt: "text/plain", log: "text/plain", md: "text/plain", csv: "text/plain",
+};
+
+/** The declared type, or one from the extension when the client declared none. */
+function typeOf(name: string, declared: string): string {
+  const type = (declared || "").split(";")[0].trim().toLowerCase();
+  if (type && type !== "application/octet-stream") return type;
+  // No dot leaves the whole name as the key, which matches nothing.
+  return BY_EXT[name.slice(name.lastIndexOf(".") + 1).toLowerCase()] ?? type;
+}
+
 const upload = multer({ dest: os.tmpdir() });
 
 const LIST_CONCURRENCY = 8;
@@ -481,14 +499,16 @@ filesRouter.get("/:prefix/:name", async (req, res) => {
     // Preview by default where a browser renders it safely; ?download=1 forces
     // the save dialog. The type is gated, not trusted, and nosniff keeps the
     // browser on the declared type instead of sniffing the bytes.
-    const type = (manifest.content_type || "").split(";")[0].trim().toLowerCase();
+    const type = typeOf(manifest.original_name, manifest.content_type);
     const previewing = req.query.download === undefined && PREVIEWABLE.test(type);
     res.setHeader("X-Content-Type-Options", "nosniff");
     res.setHeader(
       "Content-Type",
       previewing && type.startsWith("text/")
         ? "text/plain; charset=utf-8"
-        : manifest.content_type || "application/octet-stream"
+        : previewing
+          ? type
+          : manifest.content_type || "application/octet-stream"
     );
     // Non-ASCII names need both forms: a quoted fallback for simple clients and
     // the RFC 5987 filename* for anything that understands it. Percent-encoding
