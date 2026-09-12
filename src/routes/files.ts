@@ -29,6 +29,16 @@ import {
 import { MAX_SIMPLE_UPLOAD, MAX_CHUNK_BYTES } from "../utils/limits.js";
 import { signPath, verifyPath } from "../utils/signing.js";
 
+/**
+ * Types a browser renders inline that cannot execute script.
+ *
+ * Uploads are unauthenticated, so anyone can store arbitrary bytes — anything
+ * scriptable here would be stored XSS on this origin. Never add html, svg or
+ * xml. `nosniff` below is what makes the declared type the one that is used.
+ */
+const PREVIEWABLE =
+  /^(image\/(png|jpeg|gif|webp|avif|bmp|x-icon|vnd\.microsoft\.icon)|video\/(mp4|webm|ogg)|audio\/(mpeg|mp4|ogg|wav|webm)|application\/(pdf|json)|text\/(?!html$|xml$))/;
+
 const upload = multer({ dest: os.tmpdir() });
 
 const LIST_CONCURRENCY = 8;
@@ -468,13 +478,25 @@ filesRouter.get("/:prefix/:name", async (req, res) => {
       return;
     }
 
-    res.setHeader("Content-Type", manifest.content_type || "application/octet-stream");
+    // Preview by default where a browser renders it safely; ?download=1 forces
+    // the save dialog. The type is gated, not trusted, and nosniff keeps the
+    // browser on the declared type instead of sniffing the bytes.
+    const type = (manifest.content_type || "").split(";")[0].trim().toLowerCase();
+    const previewing = req.query.download === undefined && PREVIEWABLE.test(type);
+    res.setHeader("X-Content-Type-Options", "nosniff");
+    res.setHeader(
+      "Content-Type",
+      previewing && type.startsWith("text/")
+        ? "text/plain; charset=utf-8"
+        : manifest.content_type || "application/octet-stream"
+    );
     // Non-ASCII names need both forms: a quoted fallback for simple clients and
     // the RFC 5987 filename* for anything that understands it. Percent-encoding
     // inside a plain filename= would be taken literally.
     res.setHeader(
       "Content-Disposition",
-      `attachment; filename="${asciiFallback(manifest.original_name)}"; ` +
+      `${previewing ? "inline" : "attachment"}; ` +
+        `filename="${asciiFallback(manifest.original_name)}"; ` +
         `filename*=UTF-8''${encodeURIComponent(manifest.original_name)}`
     );
     // The manifest knows the total size, so this stays a plain response rather
