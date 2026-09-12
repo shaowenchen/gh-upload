@@ -10,15 +10,18 @@ import { showData, showError } from "../utils/response.js";
 import { config } from "../config.js";
 import {
   CHUNK_SIZE,
-  sha256Hex,
-  fileIdFromContentHash,
+  newFileId,
+  partsOfFileId,
+  fileIdFromPathParts,
+  isValidIdPrefix,
+  isValidFileId,
   isValidUploadId,
   sanitizeFilename,
-  isGeneratedName,
+  isManifestName,
   manifestName,
   partName,
-  HASH_ALGORITHM,
   contentHashFromBlobs,
+  LEGACY_ID_PATTERN,
   MAX_CONCURRENT_CHUNKS,
   MAX_QUEUED_CHUNKS,
   type ChunkManifest,
@@ -28,27 +31,19 @@ import { signPath, verifyPath } from "../utils/signing.js";
 
 const upload = multer({ dest: os.tmpdir() });
 
-/** Manifests fetched concurrently while building the file list. */
 const LIST_CONCURRENCY = 8;
 
-/**
- * Chunk requests admitted at once. Writing a chunk to GitHub costs roughly 3x
- * its size in transient heap (the body, its base64 encoding, the JSON copy), so
- * this bound is what keeps process memory independent of how many clients
- * upload at the same time or how aggressively they parallelise.
- */
+/** Bounds concurrent chunk writes, whose ~3x transient heap cost would otherwise scale with client count. */
 const chunkGate = createGate(MAX_CONCURRENT_CHUNKS, MAX_QUEUED_CHUNKS);
 
 export const filesRouter = Router();
 
 /**
- * Admit a chunk request only when there is room to hold and encode its body.
+ * Admit a chunk request only when there is room to hold its body.
  *
- * This runs before express.raw, because body buffering is itself the expensive
- * part — gating afterwards would bound only the encoding step while every
- * concurrent request had already claimed a full chunk of memory. Shedding load
- * here keeps process memory a function of the configured limits rather than of
- * how many clients happen to be uploading at once.
+ * Runs before express.raw because buffering the body is the expensive part:
+ * gating after it would bound only the encoding while every request had already
+ * claimed a full chunk of memory.
  */
 async function admitChunk(
   req: Request,
@@ -57,14 +52,9 @@ async function admitChunk(
 ): Promise<void> {
   const release = await chunkGate.acquire();
   if (!release) {
-    // 503 + retryable tells the client to back off and resend this chunk, which
-    // is safe: chunks are content-addressed and carry no session state.
-    //
-    // Drain the refused body before replying. Answering while the client is
-    // still writing would end the response with unread data in flight, which
-    // Node resolves by destroying the socket — the client then sees a
-    // connection reset rather than this status, and a reset reads as a network
-    // failure instead of an instruction to retry.
+    // Drain the refused body before replying: answering mid-write makes Node
+    // destroy the socket, so the client sees a connection reset instead of this
+    // retryable 503.
     req.resume();
     res.setHeader("Retry-After", "1");
     showError(res, "server busy, retry this chunk shortly", 503, true);
@@ -84,10 +74,8 @@ filesRouter.post(
   admitChunk,
   express.raw({ type: "*/*", limit: MAX_CHUNK_BYTES + 1024 }),
   async (req, res) => {
-    // A client-chosen session id. The file's real id is derived from content
-    // at completion, so this only has to be well-formed; retrying a chunk
-    // reuses the same id, and re-sending identical content resolves to the
-    // same git blob regardless.
+    // Client-chosen id for an upload in progress, unrelated to the file's id,
+    // so the legacy 32-hex shape is all that is required here.
     const uploadId = String(req.query.upload_id ?? "");
     const index = Number(req.query.index);
     const total = Number(req.query.total);
@@ -110,14 +98,10 @@ filesRouter.post(
       showError(res, "empty chunk body", 400);
       return;
     }
-    // Each chunk is stored as its own blob and the manifest records the size
-    // that was actually received, so a chunk is accepted at any size up to the
-    // cap. The old rule — every non-final chunk must be exactly the server's
-    // configured chunk size — meant a client holding a cached page or script
-    // from before a chunk-size change had every chunk of every upload rejected
-    // with a message about a number it had no way to know. What the server
-    // needs is enough to reconstruct the file, which /complete checks against
-    // the real chunk sizes rather than against an assumption.
+    // Each chunk is its own blob and the manifest records the size actually
+    // received, so any size up to the cap is accepted; /complete validates the
+    // real sizes, which is what lets a client holding a cached old chunk size
+    // still finish.
     if (body.length > MAX_CHUNK_BYTES) {
       showError(res, `chunk exceeds ${MAX_CHUNK_BYTES} bytes`, 413);
       return;
@@ -130,7 +114,6 @@ filesRouter.post(
         upload_id: uploadId,
         index,
         size: body.length,
-        sha256: sha256Hex(body),
         blob_sha: blobSha,
       });
     } catch (err) {
@@ -142,10 +125,9 @@ filesRouter.post(
 
 // POST /api/v1/files/complete - Finalize a chunked upload atomically
 //
-// The chunks themselves are the storage; a git blob cannot be concatenated, so
-// there is no assembled file object. This commits the chunk blobs (unreferenced
-// until now, hence invisible in the repo) together with the manifest that
-// describes their order, in a single commit.
+// A git blob cannot be concatenated, so the chunks are the storage: this commits
+// the chunk blobs together with the manifest describing their order, in one
+// commit.
 filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) => {
   const body = req.body as Record<string, unknown>;
   const originalName =
@@ -166,13 +148,10 @@ filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) =
     showError(res, "chunks must cover every index of total_chunks", 400);
     return;
   }
-  // Each entry may be the blob id on its own or an object carrying it, so a
-  // client that has only the ids (a shell script) and one that has the whole
-  // response (the browser) can both post what they hold.
-  //
-  // Per-chunk sizes are not accepted from the client: they are deterministic
-  // from the total, and a caller that states them wrongly would produce a
-  // corrupt file rather than an error.
+  // Each entry may be the blob id alone or an object carrying it, so a shell
+  // script and the browser can both post what they hold. Sizes are not accepted
+  // from the client: they are deterministic from the total, and a wrong one
+  // would produce a corrupt file rather than an error.
   const chunks = rawChunks.map((entry, i) => {
     const blobSha =
       typeof entry === "string"
@@ -187,14 +166,9 @@ filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) =
     return;
   }
 
-  // Validate that the stated size is consistent with the split the client
-  // describes, so a mismatch is an error now rather than a corrupt file later.
-  //
-  // The split is taken from the client rather than assumed, because the sender
-  // is not necessarily using this server's current chunk size: a page loaded
-  // before the operator changed it is still holding the old one, and its split
-  // is just as reconstructible. Only the total size and the chunk size are
-  // needed to place every slice; the last one takes the remainder.
+  // The split is taken from the client rather than assumed, because a sender
+  // with a cached page may still hold an older chunk size; only the total size
+  // and chunk size are needed to place every slice, the last taking the rest.
   const declaredChunkSize = Number(body.chunk_size);
   const chunkSize =
     Number.isInteger(declaredChunkSize) && declaredChunkSize > 0
@@ -209,8 +183,7 @@ filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) =
     );
     return;
   }
-  // The last chunk holds the remainder, and every chunk must hold at least one
-  // byte — a zero-length final slice would mean the count is one too high.
+  // The last chunk holds the remainder and must hold at least one byte.
   const lastChunkSize = size - chunkSize * (totalChunks - 1);
   if (lastChunkSize <= 0) {
     showError(
@@ -221,11 +194,10 @@ filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) =
     return;
   }
 
-  // Derived from the chunk identities rather than taken from the request: the
-  // caller has no reason to hash the file (and a browser cannot do so without
-  // buffering it), so requiring a digest only invited clients to get it wrong.
+  // Kept for integrity checks; no longer part of the address, which is the
+  // timestamp and the name.
   const contentHash = contentHashFromBlobs(chunks.map((c) => c.blob_sha));
-  const fileId = fileIdFromContentHash(contentHash);
+  const fileId = newFileId(originalName, Date.now());
   const manifest: ChunkManifest = {
     version: 2,
     file_id: fileId,
@@ -235,14 +207,11 @@ filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) =
     chunk_size: chunkSize,
     total_chunks: totalChunks,
     content_hash: contentHash,
-    hash_algorithm: HASH_ALGORITHM,
     chunks: chunks.map((c) => ({
       index: c.index,
-      // Recomputed rather than trusting the client's spelling of the name.
       name: partName(fileId, c.index, totalChunks),
-      // The size of the slice at this index under the split being finalized.
-      // The last chunk takes the remainder, which absorbs any difference
-      // between the client's chunk size and this server's.
+      // The last chunk takes the remainder, absorbing any difference between the
+      // client's chunk size and this server's.
       size: c.index === totalChunks ? size - chunkSize * (totalChunks - 1) : chunkSize,
       blob_sha: c.blob_sha,
     })),
@@ -255,10 +224,9 @@ filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) =
       Buffer.from(JSON.stringify(manifest, null, 2), "utf-8")
     );
 
-    // All chunk blobs land in the same commit as the manifest, so an upload is
-    // either fully visible or not visible at all — no half-finished file, and
-    // no stray objects if the client dies mid-way (unreferenced blobs are
-    // garbage-collected by GitHub).
+    // Chunk blobs land in the same commit as the manifest, so an upload is
+    // either fully visible or not at all — and until then the blobs are
+    // unreferenced, hence invisible and garbage-collected by GitHub.
     await github.commitFiles(
       [
         ...manifest.chunks.map((c) => ({ path: c.name, sha: c.blob_sha })),
@@ -305,14 +273,12 @@ filesRouter.post("/", upload.single("file"), async (req, res) => {
     const content = await readFile(file.path);
     const blobSha = await github.createBlob(content);
     const contentHash = contentHashFromBlobs([blobSha]);
-    const fileId = fileIdFromContentHash(contentHash);
+    const fileId = newFileId(originalName, Date.now());
 
-    // Stored in the same shape as a chunked upload — one chunk of one blob —
-    // rather than as a bare repo path. A bare path could only be served by
-    // linking straight to raw.githubusercontent.com, which bypasses this server
-    // entirely: it cannot be signed or have an expiry, and it needs the
-    // repository to be public. Routing every download through the manifest
-    // keeps one storage model and one signable URL shape.
+    // Stored in the same shape as a chunked upload rather than as a bare repo
+    // path: a bare path could only be served by linking to
+    // raw.githubusercontent.com, which bypasses this server and so cannot be
+    // signed, given an expiry, or kept private.
     const manifest: ChunkManifest = {
       version: 2,
       file_id: fileId,
@@ -322,7 +288,6 @@ filesRouter.post("/", upload.single("file"), async (req, res) => {
       chunk_size: content.length,
       total_chunks: 1,
       content_hash: contentHash,
-      hash_algorithm: HASH_ALGORITHM,
       chunks: [
         {
           index: 1,
@@ -382,16 +347,14 @@ filesRouter.get("/", async (req, res) => {
       download_url: string;
     }> = [];
 
-    // Every stored file is a manifest plus its chunks; anything else in the
-    // tree (the bootstrap README, for instance) is not a file this service
-    // manages and is not listed.
+    // Anything else in the tree (the bootstrap README) is not a managed file.
     const manifests: string[] = [];
     for (const path of entries.keys()) {
-      if (path.endsWith(".manifest.json")) manifests.push(path);
+      if (isManifestName(path)) manifests.push(path);
     }
 
-    // The tree listing already gives every plain file's size, so only manifests
-    // need a body read — and those fetch concurrently.
+    // The tree already gives every plain file's size, so only manifests read a
+    // body; those fetch concurrently.
     const loaded = await mapWithConcurrency(manifests, LIST_CONCURRENCY, async (path) => {
       try {
         const entry = entries.get(path);
@@ -424,9 +387,12 @@ filesRouter.get("/", async (req, res) => {
 });
 
 // GET /api/v1/files/:id - Metadata for a chunked upload
+//
+// The id is accepted whole rather than split into path segments, so both
+// `<timestamp>-<name>` and legacy content-hash ids resolve here.
 filesRouter.get("/:id", async (req, res) => {
   const fileId = req.params.id;
-  if (!isValidUploadId(fileId)) {
+  if (!isValidFileId(fileId)) {
     showError(res, "invalid file id", 400);
     return;
   }
@@ -439,7 +405,6 @@ filesRouter.get("/:id", async (req, res) => {
       name: manifest.original_name,
       size: manifest.size,
       content_hash: manifest.content_hash,
-      hash_algorithm: manifest.hash_algorithm,
       content_type: manifest.content_type,
       created_at: manifest.created_at,
       total_chunks: manifest.total_chunks,
@@ -450,10 +415,15 @@ filesRouter.get("/:id", async (req, res) => {
   }
 });
 
-// GET /api/v1/files/:id/download - Stream a chunked file back to the client
-filesRouter.get("/:id/download", async (req, res) => {
-  const fileId = req.params.id;
-  if (!isValidUploadId(fileId)) {
+// GET /api/v1/files/:prefix/:name - Stream a file back to the client
+//
+// The two segments are the id read back apart, so a client that names its output
+// from the URL (wget without -O, "save link as") lands on the real filename. The
+// name is part of the address, so editing it addresses a path that does not
+// exist — a 404, not a rename.
+filesRouter.get("/:prefix/:name", async (req, res) => {
+  const fileId = fileIdFromPathParts(req.params.prefix, req.params.name);
+  if (!isValidIdPrefix(req.params.prefix)) {
     showError(res, "invalid file id", 400);
     return;
   }
@@ -461,7 +431,7 @@ filesRouter.get("/:id/download", async (req, res) => {
   // When signing is configured, the link's expiry and signature are part of
   // the authorization. A link that has aged out is a normal outcome, not an
   // error in the request, so it says which it is and how to get a new one.
-  const check = verifyPath(`/api/v1/files/${fileId}/download`, {
+  const check = verifyPath(signedPathFor(req.params.prefix), {
     expires: req.query.expires ? Number(req.query.expires) : undefined,
     sig: typeof req.query.sig === "string" ? req.query.sig : undefined,
   });
@@ -485,6 +455,19 @@ filesRouter.get("/:id/download", async (req, res) => {
   try {
     const manifest = await loadManifest(github, fileId);
 
+    // The name is part of the file's address, so a name segment that does not
+    // match the file it resolved to is a request for a file that does not
+    // exist — not a decorative suffix to ignore. Without this a typo or a stale
+    // name would silently download the right bytes under the wrong URL.
+    //
+    // Legacy ids have no name segment to check against: their storage path had
+    // none, so whatever the URL carries is the old shape and is left alone.
+    if (!LEGACY_ID_PATTERN.test(req.params.prefix) &&
+        req.params.name !== manifest.original_name) {
+      showError(res, "no file at this name", 404);
+      return;
+    }
+
     res.setHeader("Content-Type", manifest.content_type || "application/octet-stream");
     // Non-ASCII names need both forms: a quoted fallback for simple clients and
     // the RFC 5987 filename* for anything that understands it. Percent-encoding
@@ -502,7 +485,13 @@ filesRouter.get("/:id/download", async (req, res) => {
   } catch (err) {
     console.error(err);
     if (!res.headersSent) {
-      showError(res, "file not found", 404);
+      // Distinguish the two failures, because only one of them is the caller's
+      // to act on. A 404 means this id has no manifest; anything else is this
+      // server failing to read a repository it can write to, and reporting that
+      // as 404 sends the caller looking for a problem that is not at their end.
+      const status = (err as { status?: number }).status;
+      const missing = status === 404 || /not a file|file not found/.test(String((err as Error)?.message));
+      showError(res, missing ? "file not found" : "read manifest failed", missing ? 404 : 502);
     } else {
       // Headers are already out; a truncated body is the only signal left.
       res.destroy();
@@ -592,15 +581,31 @@ async function streamChunks(
   if (!aborted) res.end();
 }
 
+/**
+ * Load a file's manifest.
+ *
+ * The manifest is addressed by its own path, not discovered by walking the
+ * tree: a tree walk silently returns a partial listing on a large repository,
+ * which turns a file that exists into "not found".
+ */
 async function loadManifest(
   github: GitHubService,
   fileId: string
 ): Promise<ChunkManifest> {
-  const repo = await github.getOrCreateRepo();
-  const treeSha = await github.getBranchTreeSha(repo);
-  if (!treeSha) throw new Error("repo has no commits");
-  const bytes = await github.getFileContent(treeSha, manifestName(fileId));
+  const bytes = await github.getFileContent(manifestName(fileId));
   return JSON.parse(bytes.toString("utf-8")) as ChunkManifest;
+}
+
+/**
+ * The path a download link's signature is taken over.
+ *
+ * Keyed on the timestamp segment rather than the full request path: the name is
+ * part of the address but not part of the file's identity, so signing only the
+ * prefix keeps a link's validity independent of how the name is spelled while
+ * still pinning it to one file.
+ */
+function signedPathFor(prefix: string): string {
+  return `/api/v1/files/${prefix}`;
 }
 
 /**
@@ -611,7 +616,10 @@ async function loadManifest(
  * outside the cluster can resolve.
  */
 function downloadURL(req: Request, fileId: string): string {
-  const path = `/api/v1/files/${fileId}/download`;
+  // The id's two halves are presented as separate path segments, so the URL
+  // reads `/<timestamp>/<name>` rather than repeating the name on the end.
+  const { prefix, name } = partsOfFileId(fileId);
+  const path = `${signedPathFor(prefix)}${name ? `/${encodeURIComponent(name)}` : ""}`;
   const base =
     config.downloadUrls.length > 0
       ? `https://${config.downloadUrls[0]}`
@@ -621,9 +629,9 @@ function downloadURL(req: Request, fileId: string): string {
             (req.socket && "encrypted" in req.socket ? "https" : "http");
           return `${proto}://${req.headers.host}`;
         })();
-  // Signed over the request path (not the host) so the same signature remains
-  // valid whichever hostname the link is reached through.
-  return `${base}${path}${signPath(path)}`;
+  // Signed over the path (not the host, and not the name) so the same signature
+  // remains valid whichever hostname the link is reached through.
+  return `${base}${path}${signPath(signedPathFor(prefix))}`;
 }
 
 /**

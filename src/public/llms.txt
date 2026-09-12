@@ -81,7 +81,7 @@ Every failure is JSON with an HTTP status code, never a 200 carrying a failure:
 | 400 | The request is malformed | Fix the request; retrying will not help |
 | 401 | Not used; no credential is required | — |
 | 403 | Link signature missing or altered | Use the URL exactly as issued |
-| 404 | No such file id | Check the id |
+| 404 | No such file, or the URL's name segment does not match it | Check the id; use the URL exactly as issued |
 | 410 | The download link expired | Obtain a fresh link from the file's metadata |
 | 413 | Body too large | Split the file and use the chunk endpoints |
 | 502 | The git backend failed upstream | Retry — usually transient |
@@ -96,24 +96,41 @@ Retrying is safe and will not produce duplicates:
 
 - Chunks are written as content-addressed git blobs, so re-sending identical
   bytes resolves to the same object.
-- The file's identity is derived from its chunk ids, not from a client-supplied
-  value, so the same file always lands on the same id.
 - The final commit is a single atomic ref update. A partial upload is never
   visible: either the whole file exists or none of it does.
+
+Re-running `upload.sh` on the same file does create a **second** file, though:
+ids are timestamps, so a retry after the upload succeeded has no way to know it
+already landed. If a retry might be a duplicate, list the files first — or accept
+the extra entry, since the earlier one keeps its own URL.
 
 An interrupted `upload.sh` can simply be re-run.
 
 ## Uploading the same content twice
 
-Identity is derived from content, not from the filename or the upload session.
-Two uploads with identical bytes produce the **same `file_id`**, so the second
-replaces the first's manifest and `GET /api/v1/files` shows one entry — with the
-name from the most recent upload. This is intended (it is what makes retries
-safe), but it means you cannot store two files with identical content under
-different names.
+A file's id is its storage path: `<timestamp>-<name>`, where the timestamp is
+milliseconds since the epoch at finalize time. It is **not** derived from the
+content, so two uploads of identical bytes are two separate files with separate
+URLs, and each occupies its own manifest. Re-uploading a file does not replace
+the earlier one.
 
-To keep several versions, vary the content or the name in a way that changes the
-bytes. A file's size and bytes are what identify it, not its name.
+The id is also not the same as the URL. The id reads `<timestamp>-<name>`; the
+download URL presents those two halves as separate segments:
+
+    file_id  <timestamp>-<name>
+    URL      /api/v1/files/<timestamp>/<name>
+
+Nothing needs to be read or hashed to place a file, which is what makes an id
+immediate. The trade is that **the name is part of the address**: it has to be
+in the path for the repository to be readable, so editing the name segment of a
+URL addresses a path that does not exist and is a 404, not a rename.
+
+Two uploads collide only if they finalize in the same millisecond *and* carry the
+same filename. When they do, the later commit replaces the earlier manifest —
+a lost file rather than a corrupt one. Uploading from several places at once
+under the same name within one millisecond is the only way to hit this.
+
+If you need to keep a file rather than have it replaced, use a different name.
 
 ## API reference
 
@@ -133,7 +150,7 @@ above on failure. No endpoint requires a credential.
     POST /api/v1/files/chunks
       ?upload_id=<32 hex chars>&index=<1..total>&total=<n>
       Body: raw bytes (Content-Type: application/octet-stream)
-      -> {upload_id, index, size, sha256, blob_sha}
+      -> {upload_id, index, size, blob_sha}
       Chunk size is yours to choose up to 32MiB; use the advertised
       chunk_size unless you have a reason not to. The server records the size
       it actually received, so a split that is not uniform still reconstructs
@@ -162,13 +179,21 @@ above on failure. No endpoint requires a credential.
 
     GET  /api/v1/files/<file_id>
       -> metadata for a chunked upload: {file_id, name, size, content_hash,
-         hash_algorithm, content_type, created_at, total_chunks, download_url}
+         content_type, created_at, total_chunks, download_url}
 
-    GET  /api/v1/files/<file_id>/download
+    GET  /api/v1/files/<timestamp>/<filename>
       -> the file bytes. No credential required, but a signed link's
          ?expires=&sig= must be sent exactly as issued.
          403 = signature missing, altered, or not issued by this server.
          410 = the link expired; obtain a new one.
+      The two segments are the file's id read back apart: the repository stores
+      `<timestamp>-<filename>` as one path, and the URL splits it so that
+      clients which name their output from the URL (wget without -O, "save link
+      as") land on the real filename:
+          wget "<download_url>"   # writes the file under its own name
+      Both segments are part of the address, so editing the filename addresses a
+      path that does not exist (404), not a renamed file. The signature covers
+      /api/v1/files/<timestamp> only.
 
     POST /api/v1/clear
       DESTRUCTIVE: deletes the ENTIRE repository and every file in it. There is
@@ -177,18 +202,17 @@ above on failure. No endpoint requires a credential.
 
 ## content_hash
 
-`content_hash` identifies a file. It is the sha256 of the ordered chunk blob
+`content_hash` is recorded, not addressed: a file is located by its id, and the
+hash is there to compare two uploads. It is the sha256 of the ordered chunk blob
 ids, which is **not** the sha256 of the file bytes — clients never hash the file
-(a browser cannot hash a stream, so it would have to buffer all of it). The
-manifest records this as `hash_algorithm: "sha256-git-blob-ids-v1"`.
+(a browser cannot hash a stream, so it would have to buffer all of it).
 
-Use it to compare two uploads for sameness. Do not present it as a checksum of
-the file's contents.
+Do not present it as a checksum of the file's contents.
 
 ## Verifying a download
 
-The server checks chunk integrity when streaming, and each download sets an
-exact `Content-Length`, so a truncated transfer is detectable:
+Each download sets an exact `Content-Length`, so a truncated transfer is
+detectable:
 
     curl -fsSL -o out.bin "$DOWNLOAD_URL"
     # compare byte count against the "size" reported at upload time
@@ -196,7 +220,10 @@ exact `Content-Length`, so a truncated transfer is detectable:
 ## Notes for agents
 
 - The download URL is public and permanent. Treat it as the deliverable.
-- Do not re-upload unchanged files: the id is content-derived, and the same
-  content lands on the same id.
+- A file's id is a timestamp plus its name, not a content hash — re-uploading
+  the same bytes creates a second file rather than reusing the first.
+- Uploading the same name twice in the same millisecond replaces the first; the
+  window is that narrow, so ordinary retries are safe and same-name uploads
+  seconds apart are two files.
 - There is no TTL and no per-file delete. Uploaded files accumulate; ask an
   operator to clear the repository if that matters.
