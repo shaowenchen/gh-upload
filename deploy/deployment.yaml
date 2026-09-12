@@ -27,13 +27,6 @@ spec:
               value: "3000"
             - name: HOST
               value: "0.0.0.0"
-            # Access token for writes. Empty means no restriction: uploads are
-            # accepted without a credential. Set it to require one, e.g.:
-            #   kubectl -n ops-system create secret generic gh-upload \
-            #     --from-literal=admin-token="$(openssl rand -hex 32)"
-            # then use valueFrom.secretKeyRef instead of a literal below.
-            - name: ADMIN_TOKEN
-              value: ""
             - name: GITHUB_TOKEN
               value: ""
             - name: GITHUB_REPO

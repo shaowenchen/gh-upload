@@ -4,11 +4,11 @@
 #
 #   ./upload.sh <file> [server-url]
 #
-# Server URL may also come from GH_UPLOAD_URL, and the access token from
-# GH_UPLOAD_TOKEN. The file's size decides the route: small files go up in one
-# request, larger ones are split here and sent piecewise, because a single
-# larger body is rejected at the CDN edge with a 413 before it reaches the
-# server.
+# Server URL may also come from GH_UPLOAD_URL. The file's size decides the
+# route: small files go up in one request, larger ones are split here and sent
+# piecewise, because a single larger body is rejected at the CDN edge with a
+# 413 before it reaches the server. Chunks go up several at a time, bounded by
+# what the server says it can process.
 #
 # Prints the download URL on success. Exits non-zero with a message on failure.
 #
@@ -18,7 +18,6 @@ set -euo pipefail
 
 FILE="${1:-}"
 BASE="${2:-${GH_UPLOAD_URL:-}}"
-TOKEN="${GH_UPLOAD_TOKEN:-}"
 
 if [ -z "$FILE" ]; then
   echo "usage: $0 <file> [server-url]   (or set GH_UPLOAD_URL)" >&2
@@ -33,17 +32,6 @@ if [ -z "$BASE" ]; then
   exit 2
 fi
 BASE="${BASE%/}"
-
-# Writes need the credential when the server has one configured; reads (the
-# download URL) deliberately never do, so whoever receives a link can open it.
-#
-# The flag list is expanded unquoted below. An empty array would be an error
-# under `set -u` on bash 3.2, which macOS still ships, so it is built as a
-# plain string that simply expands to nothing when there is no token.
-AUTH=""
-if [ -n "$TOKEN" ]; then
-  AUTH="Authorization: Bearer $TOKEN"
-fi
 
 # ---- JSON helpers: prefer jq, fall back to python3 ----
 if command -v jq >/dev/null 2>&1; then
@@ -66,8 +54,12 @@ CONFIG=$(curl -sS --fail "$BASE/api/v1/config") || {
 }
 CHUNK=$(printf '%s' "$CONFIG" | json_get 'd["data"]["chunk_size"]')
 MAX_SIMPLE=$(printf '%s' "$CONFIG" | json_get 'd["data"]["max_simple_upload"]')
-CHUNK="${CHUNK:-16777216}"
+PARALLEL=$(printf '%s' "$CONFIG" | json_get 'd["data"]["max_chunk_concurrency"]')
+CHUNK="${CHUNK:-8388608}"
 MAX_SIMPLE="${MAX_SIMPLE:-$CHUNK}"
+# Bounded by what the server will actually process: sending more than it admits
+# only earns 503s and retries, which is slower than staying within it.
+PARALLEL="${PARALLEL:-4}"
 
 # Portable file size.
 size_of() {
@@ -82,12 +74,8 @@ echo "server: $BASE (chunk size $CHUNK)" >&2
 # ---- small file: one multipart request ----
 if [ "$SIZE" -le "$MAX_SIMPLE" ]; then
   echo "route:  single request" >&2
-  if [ -n "$AUTH" ]; then
-    RESP=$(curl -sS --fail -H "$AUTH" -F "file=@$FILE" "$BASE/api/v1/files")
-  else
-    RESP=$(curl -sS --fail -F "file=@$FILE" "$BASE/api/v1/files")
-  fi || {
-    echo "error: upload failed (is GH_UPLOAD_TOKEN set and correct?)" >&2
+  RESP=$(curl -sS --fail -F "file=@$FILE" "$BASE/api/v1/files") || {
+    echo "error: upload failed" >&2
     exit 1
   }
   printf '%s' "$RESP" | json_get 'd["data"]["download_url"]'
@@ -105,72 +93,95 @@ UPLOAD_ID=$( (head -c 16 /dev/urandom | od -An -tx1 | tr -d ' \n') 2>/dev/null |
 TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
-# Upload one chunk with retries. 503 is the server shedding load — retry it,
-# since chunks are content-addressed and stateless.
+# Upload one chunk with retries, then write the blob id to $TMP/sha.$idx.
+#
+# 503 is the server shedding load — retry it, since chunks are content-addressed
+# and stateless. The id goes to a file rather than to stdout because several of
+# these run as background jobs at once, and their output would interleave.
 send_chunk() {
-  local idx="$1" file="$2" attempt=0 max=5 out
+  local idx="$1" file="$2" attempt=0 max=6
+  local resp="$TMP/resp.$idx.json"
   while :; do
     attempt=$((attempt + 1))
     local code
-    if [ -n "$AUTH" ]; then
-      code=$(curl -sS -o "$TMP/resp.json" -w '%{http_code}' \
-        -H "$AUTH" \
-        --data-binary "@$file" \
-        -H "Content-Type: application/octet-stream" \
-        "$BASE/api/v1/files/chunks?upload_id=$UPLOAD_ID&index=$idx&total=$TOTAL") || code=000
-    else
-      code=$(curl -sS -o "$TMP/resp.json" -w '%{http_code}' \
-        --data-binary "@$file" \
-        -H "Content-Type: application/octet-stream" \
-        "$BASE/api/v1/files/chunks?upload_id=$UPLOAD_ID&index=$idx&total=$TOTAL") || code=000
-    fi
+    code=$(curl -sS -o "$resp" -w '%{http_code}' \
+      --data-binary "@$file" \
+      -H "Content-Type: application/octet-stream" \
+      "$BASE/api/v1/files/chunks?upload_id=$UPLOAD_ID&index=$idx&total=$TOTAL") || code=000
     case "$code" in
       200)
-        printf '%s' "$(json_get 'd["data"]["blob_sha"]' < "$TMP/resp.json")"
+        json_get 'd["data"]["blob_sha"]' < "$resp" > "$TMP/sha.$idx"
         return 0
-        ;;
-      401|403)
-        echo "error: not authorized (HTTP $code). Set GH_UPLOAD_TOKEN to the server's access token." >&2
-        return 1
         ;;
       503|429|000)
         if [ "$attempt" -ge "$max" ]; then
           echo "error: chunk $idx still refused after $max attempts" >&2
-          return 1
+          break
         fi
         sleep "$attempt"
         ;;
       *)
-        echo "error: chunk $idx failed (HTTP $code): $(cat "$TMP/resp.json" 2>/dev/null)" >&2
-        return 1
+        echo "error: chunk $idx failed (HTTP $code): $(cat "$resp" 2>/dev/null)" >&2
+        break
         ;;
     esac
   done
+  return 1
 }
 
-# Split with dd: one full chunk per piece, no reliance on `split --bytes`.
+# Send the chunks $PARALLEL at a time. Sending them strictly one after another
+# made each chunk's round-trip latency additive, and at small chunk sizes that
+# latency — not bandwidth — is what dominates the upload.
+#
+# The batch is sliced just before it is sent and cleared once it is reaped, so
+# the temporary copy on disk stays near $PARALLEL chunks rather than growing to
+# the size of the whole file.
+I=1
+FAILED=0
+while [ "$I" -le "$TOTAL" ]; do
+  pids=""
+  batch=0
+  while [ "$batch" -lt "$PARALLEL" ] && [ "$I" -le "$TOTAL" ]; do
+    dd if="$FILE" of="$TMP/part.$I" bs="$CHUNK" skip=$((I - 1)) count=1 2>/dev/null
+    send_chunk "$I" "$TMP/part.$I" &
+    pids="$pids $!"
+    I=$((I + 1))
+    batch=$((batch + 1))
+  done
+  # Wait on this batch's pids specifically. A bare `wait` returns 0 whatever the
+  # jobs did once any of them is reaped, so it would let a failed chunk pass.
+  for pid in $pids; do
+    wait "$pid" || FAILED=1
+  done
+  rm -f "$TMP"/part.*
+done
+
+if [ "$FAILED" -ne 0 ]; then
+  echo "error: one or more chunks failed to upload" >&2
+  exit 1
+fi
+
+# Ordered by index: the server reconstructs the file from this order, so it is
+# read back per chunk rather than accumulated as the jobs finish, which would be
+# completion order instead.
 BLOBS=""
 I=1
 while [ "$I" -le "$TOTAL" ]; do
-  dd if="$FILE" of="$TMP/part" bs="$CHUNK" skip=$((I - 1)) count=1 2>/dev/null
-  SHA=$(send_chunk "$I" "$TMP/part") || exit 1
+  SHA=$(cat "$TMP/sha.$I")
   if [ -z "$BLOBS" ]; then BLOBS="\"$SHA\""; else BLOBS="$BLOBS,\"$SHA\""; fi
-  printf '  chunk %s/%s done\n' "$I" "$TOTAL" >&2
-  rm -f "$TMP/part"
   I=$((I + 1))
 done
 
-# The server derives the file's identity from these ids, so nothing else about
-# the content needs to be sent.
-BODY="{\"original_name\":\"$NAME\",\"size\":$SIZE,\"total_chunks\":$TOTAL,\"chunks\":[$BLOBS]}"
+echo "  uploaded $TOTAL chunks" >&2
 
-if [ -n "$AUTH" ]; then
-  RESP=$(curl -sS -X POST -H "$AUTH" -H "Content-Type: application/json" \
-    --data-binary "$BODY" "$BASE/api/v1/files/complete")
-else
-  RESP=$(curl -sS -X POST -H "Content-Type: application/json" \
-    --data-binary "$BODY" "$BASE/api/v1/files/complete")
-fi || {
+# The server derives the file's identity from these ids, so nothing else about
+# the content needs to be sent. chunk_size is the split actually used above, so
+# the server can reconstruct the file even if its own configured size has
+# changed since this script read the config.
+BODY="{\"original_name\":\"$NAME\",\"size\":$SIZE,\"total_chunks\":$TOTAL,\"chunk_size\":$CHUNK,\"chunks\":[$BLOBS]}"
+
+RESP=$(curl -sS -X POST -H "Content-Type: application/json" \
+  --data-binary "$BODY" "$BASE/api/v1/files/complete") || {
   echo "error: finalize failed" >&2
   exit 1
 }

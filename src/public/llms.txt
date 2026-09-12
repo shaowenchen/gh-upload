@@ -10,19 +10,14 @@ Preferred: fetch and run the uploader this server hosts. It splits large files
 correctly and reads the server's limits, so it cannot drift out of sync.
 
     export GH_UPLOAD_URL="<the server URL you were given>"
-    export GH_UPLOAD_TOKEN="<the access token you were given>"   # omit if not needed
 
     curl -fsSL "$GH_UPLOAD_URL/upload.sh" -o upload.sh
     bash upload.sh /path/to/file
     # -> prints the download URL on stdout; progress goes to stderr
 
-`upload.sh` sends the token only when `GH_UPLOAD_TOKEN` is set, so the same
-invocation works whether or not the server requires one.
-
 Small files also work with plain curl:
 
-    curl -sS -H "Authorization: Bearer $GH_UPLOAD_TOKEN" \
-         -F "file=@/path/to/file" "$GH_UPLOAD_URL/api/v1/files"
+    curl -sS -F "file=@/path/to/file" "$GH_UPLOAD_URL/api/v1/files"
 
 ## Read this before doing it yourself
 
@@ -42,30 +37,22 @@ is what `upload.sh` does.
       "data": {
         "api_base_url": "https://...",          # public base; use this for links
         "upload_url": "https://.../api/v1/files",
-        "chunk_size": 16777216,                 # bytes per chunk
-        "max_simple_upload": 16777216,          # largest single-request upload
-        "auth_required": false                  # whether writes need the token
+        "chunk_size": 8388608,                  # bytes per chunk
+        "max_simple_upload": 8388608,           # largest single-request upload
+        "max_chunk_concurrency": 8,             # chunks the server processes at once
+        "signed_links": true,                   # whether download links expire
+        "link_ttl_seconds": 604800
       }
     }
 
-**Concurrency is limited server-side.** Sending many chunks at once is fine and
-is what the script does, but the server admits only a few at a time and answers
-HTTP 503 with `"retryable": true` for the rest. Honour that: back off briefly
-and resend the same chunk. A retry is always safe — see Idempotency.
+**Size your in-flight window to `max_chunk_concurrency`.** The server admits
+that many chunks at a time; sending more does not go faster, it just earns 503s
+and backoff sleeps. `upload.sh` reads this value rather than assuming one.
 
 ## Authentication
 
-The access token is a global switch on writes.
-
-- **If the server has one configured**, every write must send it:
-  `Authorization: Bearer <token>`. Without it, writes fail with HTTP 401.
-- **If the server has none configured**, writes need no credential and go
-  through. Run `GET /api/v1/config` and check `auth_required` to find out which
-  applies — do not assume.
-
-Reads are never gated by the access token, either way. The download URL is the
-deliverable, so it stays openable by whoever receives the link. Do not append
-the token to a shared URL.
+There is none. Writes need no credential, and reads never did — the download
+URL is the deliverable, so it stays openable by whoever receives the link.
 
 ## Download links may expire
 
@@ -92,7 +79,7 @@ Every failure is JSON with an HTTP status code, never a 200 carrying a failure:
 | Status | Meaning | What to do |
 |---|---|---|
 | 400 | The request is malformed | Fix the request; retrying will not help |
-| 401 | Missing or wrong access token | Check `GH_UPLOAD_TOKEN` (only when `auth_required` is true) |
+| 401 | Not used; no credential is required | — |
 | 403 | Link signature missing or altered | Use the URL exactly as issued |
 | 404 | No such file id | Check the id |
 | 410 | The download link expired | Obtain a fresh link from the file's metadata |
@@ -131,37 +118,43 @@ bytes. A file's size and bytes are what identify it, not its name.
 ## API reference
 
 All responses are `{"code": 0, "data": ...}` on success and the error shape
-above on failure. `{auth}` marks the endpoints needing the bearer token.
+above on failure. No endpoint requires a credential.
 
     GET  /api/v1/config
     GET  /api/version
     GET  /health
 
-    POST /api/v1/files                        {auth}
+    POST /api/v1/files
       multipart/form-data, field "file"
       -> {file_id, name, size, content_hash, content_type, download_url}
       Fails with 413 above max_simple_upload. Stored in the same form as a
       chunked upload, so its download_url is a normal (possibly signed) link.
 
-    POST /api/v1/files/chunks                 {auth}
+    POST /api/v1/files/chunks
       ?upload_id=<32 hex chars>&index=<1..total>&total=<n>
       Body: raw bytes (Content-Type: application/octet-stream)
       -> {upload_id, index, size, sha256, blob_sha}
-      Every chunk except the last must be exactly chunk_size bytes.
+      Chunk size is yours to choose up to 32MiB; use the advertised
+      chunk_size unless you have a reason not to. The server records the size
+      it actually received, so a split that is not uniform still reconstructs
+      correctly.
       upload_id is any 32-character hex string you choose; it only labels the
       session. Retries may reuse it.
       HTTP 503 here means overload: back off and resend.
 
-    POST /api/v1/files/complete               {auth}
+    POST /api/v1/files/complete
       {"original_name": "report.pdf",
        "size": 41943040,
        "total_chunks": 3,
+       "chunk_size": 8388608,                 (optional; the split you used)
        "content_type": "application/pdf",     (optional)
        "chunks": ["<blob_sha>", "<blob_sha>", "<blob_sha>"]}
       -> {file_id, name, size, content_hash, download_url}
       Send the blob ids in order; chunk entries may be bare strings or the
-      objects returned by /chunks. Do not send sizes — the server derives them
-      from `size`, and a wrong value would corrupt the file rather than error.
+      objects returned by /chunks. Send chunk_size only if you did not split
+      at the advertised size — it is what lets the server place each slice.
+      Do not send per-chunk sizes — the server derives them, and a wrong value
+      would corrupt the file rather than error.
 
     GET  /api/v1/files
       -> {list: [{name, size, timestamp, download_url, content_hash?}]}
@@ -172,12 +165,12 @@ above on failure. `{auth}` marks the endpoints needing the bearer token.
          hash_algorithm, content_type, created_at, total_chunks, download_url}
 
     GET  /api/v1/files/<file_id>/download
-      -> the file bytes. No access token required, but a signed link's
+      -> the file bytes. No credential required, but a signed link's
          ?expires=&sig= must be sent exactly as issued.
          403 = signature missing, altered, or not issued by this server.
          410 = the link expired; obtain a new one.
 
-    POST /api/v1/clear                        {auth}
+    POST /api/v1/clear
       DESTRUCTIVE: deletes the ENTIRE repository and every file in it. There is
       no per-file delete. Never call this unless explicitly instructed to remove
       everything.

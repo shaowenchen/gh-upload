@@ -10,6 +10,63 @@ const REPO_CACHE_TTL_MS = 60_000;
 /** Attempts to land a commit before giving up on ref contention. */
 const COMMIT_MAX_ATTEMPTS = 5;
 
+/** Attempts for a single GitHub API call before the failure reaches the client. */
+const API_MAX_ATTEMPTS = 4;
+
+/** Longest a retry will wait, so a bad header cannot stall an upload. */
+const RETRY_MAX_DELAY_MS = 30_000;
+
+/**
+ * Whether a failed GitHub call is worth trying again.
+ *
+ * Asking this server rather than the client to retry is the point: a chunk that
+ * fails upstream currently costs the client the whole chunk, its own backoff,
+ * and a re-send — for a failure that was probably a few hundred milliseconds
+ * long. Absorbing it here turns that into a pause the client never sees.
+ */
+function isRetryable(err: unknown): boolean {
+  const e = err as { status?: number; message?: string };
+  const status = e.status;
+
+  if (status === 429) return true;
+  // 500/502/503/504 are the transient upstream failures, and are the common
+  // case: GitHub answers 502/503 under load and during internal deploys.
+  if (status !== undefined && status >= 500) return true;
+  // A 403 is either a genuine permission problem or an exhausted rate limit,
+  // and only the second is worth waiting out. They are distinguishable from
+  // the message, which GitHub words explicitly for the rate-limit case.
+  if (status === 403) {
+    const message = (e.message || "").toLowerCase();
+    return message.includes("rate limit") || message.includes("secondary rate");
+  }
+  // No status at all means the request never got an answer: a dropped
+  // connection, a socket timeout, a DNS blip. These are exactly the failures a
+  // retry is meant to hide, and they are invisible to the client otherwise.
+  if (status === undefined) return true;
+
+  // Everything else — 401, 404, 422 — is a real answer that will not change.
+  return false;
+}
+
+/**
+ * Delay before the given retry, with jitter.
+ *
+ * The jitter matters more than the base: chunks are uploaded concurrently and
+ * fail together when the upstream is struggling, so without it every retry
+ * returns at the same instant and reproduces the overload it was backing off
+ * from.
+ */
+function retryDelayMs(attempt: number, retryAfterHeader?: string): number {
+  // An explicit Retry-After is authoritative — GitHub sets it on secondary rate
+  // limits, and coming back sooner just earns another rejection.
+  const retryAfter = Number(retryAfterHeader);
+  if (Number.isFinite(retryAfter) && retryAfter > 0) {
+    return Math.min(retryAfter * 1000, RETRY_MAX_DELAY_MS);
+  }
+  const base = Math.min(300 * 2 ** (attempt - 1), 8_000);
+  return Math.floor(base / 2 + Math.random() * (base / 2));
+}
+
 /**
  * Committed as the repository's first commit, to bring it into existence.
  * The git-data API cannot write to a repository with no commits, so something
@@ -125,22 +182,58 @@ export class GitHubService {
   }
 
   /**
+   * Run a GitHub call, retrying the failures that are worth retrying.
+   *
+   * Only raises the error once the attempts are exhausted, so a caller that
+   * reports a 502 to the client is reporting something genuinely persistent
+   * rather than a single unlucky request.
+   */
+  private async withRetry<T>(label: string, fn: () => Promise<T>): Promise<T> {
+    let lastErr: unknown;
+    for (let attempt = 1; attempt <= API_MAX_ATTEMPTS; attempt++) {
+      try {
+        return await fn();
+      } catch (err) {
+        lastErr = err;
+        if (!isRetryable(err) || attempt === API_MAX_ATTEMPTS) throw err;
+        const delay = retryDelayMs(
+          attempt,
+          (err as { response?: { headers?: Record<string, string> } }).response?.headers?.[
+            "retry-after"
+          ]
+        );
+        console.warn(
+          `github ${label} failed (attempt ${attempt}/${API_MAX_ATTEMPTS}), retrying in ${delay}ms`
+        );
+        await new Promise((resolve) => setTimeout(resolve, delay));
+      }
+    }
+    throw lastErr;
+  }
+
+  /**
    * Write a blob and return its sha.
    *
    * Blobs are content-addressed and attach to no ref, so chunks can be uploaded
    * concurrently without contending for the branch ref — and re-sending a chunk
    * of identical content resolves to the same object instead of a second write.
    * Only commitFiles touches the ref.
+   *
+   * This is the hot path for a large upload, so it carries the retry: an upload
+   * makes one of these per chunk, and a transient failure here is the single
+   * most likely way for a chunk to fail.
    */
   async createBlob(content: Buffer): Promise<string> {
     const repo = await this.getOrCreateRepo();
     await this.ensureWritable(repo);
-    const { data } = await this.octokit.rest.git.createBlob({
-      owner: REPO_OWNER,
-      repo: repo.name,
-      content: content.toString("base64"),
-      encoding: "base64",
-    });
+    const { data } = await this.withRetry("createBlob", () =>
+      this.octokit.rest.git.createBlob({
+        owner: REPO_OWNER,
+        repo: repo.name,
+        content: content.toString("base64"),
+        encoding: "base64",
+      })
+    );
     return data.sha;
   }
 
@@ -148,14 +241,20 @@ export class GitHubService {
    * Read a blob by sha. Preferred over path lookups for chunk reads: the
    * manifest already carries each chunk's blob sha, so streaming a file needs
    * no tree walks at all.
+   *
+   * Retried because a download walks every chunk in turn: without it, one
+   * transient failure part-way through truncates the response, and the client
+   * has no way to resume.
    */
   async getBlob(sha: string): Promise<Buffer> {
     const repo = await this.getOrCreateRepo();
-    const { data } = await this.octokit.rest.git.getBlob({
-      owner: REPO_OWNER,
-      repo: repo.name,
-      file_sha: sha,
-    });
+    const { data } = await this.withRetry("getBlob", () =>
+      this.octokit.rest.git.getBlob({
+        owner: REPO_OWNER,
+        repo: repo.name,
+        file_sha: sha,
+      })
+    );
     return Buffer.from(data.content, "base64");
   }
 
@@ -168,12 +267,14 @@ export class GitHubService {
    */
   async getTreeEntries(treeSha: string): Promise<Map<string, TreeEntry>> {
     const repo = await this.getOrCreateRepo();
-    const { data } = await this.octokit.rest.git.getTree({
-      owner: REPO_OWNER,
-      repo: repo.name,
-      tree_sha: treeSha,
-      recursive: "1",
-    });
+    const { data } = await this.withRetry("getTree", () =>
+      this.octokit.rest.git.getTree({
+        owner: REPO_OWNER,
+        repo: repo.name,
+        tree_sha: treeSha,
+        recursive: "1",
+      })
+    );
 
     const map = new Map<string, TreeEntry>();
     for (const entry of data.tree) {
@@ -312,27 +413,31 @@ export class GitHubService {
     for (let attempt = 1; attempt <= COMMIT_MAX_ATTEMPTS; attempt++) {
       const head = await this.getBranchHead(repo);
 
-      const { data: tree } = await this.octokit.rest.git.createTree({
-        owner: REPO_OWNER,
-        repo: repo.name,
-        ...(head ? { base_tree: head.treeSha } : {}),
-        tree: files.map((f) => ({
-          path: f.path,
-          mode: "100644" as const,
-          type: "blob" as const,
-          sha: f.sha,
-        })),
-      });
+      const { data: tree } = await this.withRetry("createTree", () =>
+        this.octokit.rest.git.createTree({
+          owner: REPO_OWNER,
+          repo: repo.name,
+          ...(head ? { base_tree: head.treeSha } : {}),
+          tree: files.map((f) => ({
+            path: f.path,
+            mode: "100644" as const,
+            type: "blob" as const,
+            sha: f.sha,
+          })),
+        })
+      );
 
-      const { data: commit } = await this.octokit.rest.git.createCommit({
-        owner: REPO_OWNER,
-        repo: repo.name,
-        message,
-        tree: tree.sha,
-        ...(head ? { parents: [head.commitSha] } : {}),
-        author: { name: this.commitName, email: this.commitEmail },
-        committer: { name: this.commitName, email: this.commitEmail },
-      });
+      const { data: commit } = await this.withRetry("createCommit", () =>
+        this.octokit.rest.git.createCommit({
+          owner: REPO_OWNER,
+          repo: repo.name,
+          message,
+          tree: tree.sha,
+          ...(head ? { parents: [head.commitSha] } : {}),
+          author: { name: this.commitName, email: this.commitEmail },
+          committer: { name: this.commitName, email: this.commitEmail },
+        })
+      );
 
       if (!head) {
         // First commit on this branch — create the ref at it. A racing creator

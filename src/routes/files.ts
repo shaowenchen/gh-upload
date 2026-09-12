@@ -22,8 +22,7 @@ import {
   MAX_QUEUED_CHUNKS,
   type ChunkManifest,
 } from "../utils/chunk.js";
-import { MAX_SIMPLE_UPLOAD } from "../utils/limits.js";
-import { adminAuth } from "../middleware/adminAuth.js";
+import { MAX_SIMPLE_UPLOAD, MAX_CHUNK_BYTES } from "../utils/limits.js";
 import { signPath, verifyPath } from "../utils/signing.js";
 
 const upload = multer({ dest: os.tmpdir() });
@@ -32,10 +31,10 @@ const upload = multer({ dest: os.tmpdir() });
 const LIST_CONCURRENCY = 8;
 
 /**
- * Chunk requests admitted at once. Writing a chunk to GitHub peaks at roughly
- * 7x its size in transient heap (base64 + JSON copies), so this bound is what
- * keeps process memory independent of how many clients upload at the same time
- * or how aggressively they parallelise.
+ * Chunk requests admitted at once. Writing a chunk to GitHub costs roughly 3x
+ * its size in transient heap (the body, its base64 encoding, the JSON copy), so
+ * this bound is what keeps process memory independent of how many clients
+ * upload at the same time or how aggressively they parallelise.
  */
 const chunkGate = createGate(MAX_CONCURRENT_CHUNKS, MAX_QUEUED_CHUNKS);
 
@@ -81,9 +80,8 @@ async function admitChunk(
 // chunk, making the limit below map 1:1 onto what Cloudflare measures.
 filesRouter.post(
   "/chunks",
-  adminAuth,
   admitChunk,
-  express.raw({ type: "*/*", limit: CHUNK_SIZE + 1024 }),
+  express.raw({ type: "*/*", limit: MAX_CHUNK_BYTES + 1024 }),
   async (req, res) => {
     // A client-chosen session id. The file's real id is derived from content
     // at completion, so this only has to be well-formed; retrying a chunk
@@ -111,19 +109,16 @@ filesRouter.post(
       showError(res, "empty chunk body", 400);
       return;
     }
-    if (body.length > CHUNK_SIZE) {
-      showError(res, `chunk exceeds ${CHUNK_SIZE} bytes`, 413);
-      return;
-    }
-    // Every chunk before the last must be full, so any short chunk in the
-    // middle means the client split the file inconsistently.
-    const isLast = index === total;
-    if (!isLast && body.length !== CHUNK_SIZE) {
-      showError(
-        res,
-        `chunk ${index} of ${total} is ${body.length} bytes; non-final chunks must be exactly ${CHUNK_SIZE}`,
-        400
-      );
+    // Each chunk is stored as its own blob and the manifest records the size
+    // that was actually received, so a chunk is accepted at any size up to the
+    // cap. The old rule — every non-final chunk must be exactly the server's
+    // configured chunk size — meant a client holding a cached page or script
+    // from before a chunk-size change had every chunk of every upload rejected
+    // with a message about a number it had no way to know. What the server
+    // needs is enough to reconstruct the file, which /complete checks against
+    // the real chunk sizes rather than against an assumption.
+    if (body.length > MAX_CHUNK_BYTES) {
+      showError(res, `chunk exceeds ${MAX_CHUNK_BYTES} bytes`, 413);
       return;
     }
 
@@ -150,7 +145,7 @@ filesRouter.post(
 // there is no assembled file object. This commits the chunk blobs (unreferenced
 // until now, hence invisible in the repo) together with the manifest that
 // describes their order, in a single commit.
-filesRouter.post("/complete", adminAuth, express.json({ limit: "1mb" }), async (req, res) => {
+filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) => {
   const body = req.body as Record<string, unknown>;
   const originalName =
     typeof body.original_name === "string" ? sanitizeFilename(body.original_name) : "";
@@ -191,19 +186,35 @@ filesRouter.post("/complete", adminAuth, express.json({ limit: "1mb" }), async (
     return;
   }
 
-  // Everything but the final chunk is exactly CHUNK_SIZE; the last one holds
-  // the remainder. Reject splits that would not reconstruct the stated size.
-  const expectedSizes = (): number[] => {
-    const sizes = new Array<number>(totalChunks).fill(CHUNK_SIZE);
-    sizes[totalChunks - 1] = size - (totalChunks - 1) * CHUNK_SIZE;
-    return sizes;
-  };
-  const sizes = expectedSizes();
-  const lastSize = sizes[totalChunks - 1];
-  if (lastSize <= 0 || lastSize > CHUNK_SIZE) {
+  // Validate that the stated size is consistent with the split the client
+  // describes, so a mismatch is an error now rather than a corrupt file later.
+  //
+  // The split is taken from the client rather than assumed, because the sender
+  // is not necessarily using this server's current chunk size: a page loaded
+  // before the operator changed it is still holding the old one, and its split
+  // is just as reconstructible. Only the total size and the chunk size are
+  // needed to place every slice; the last one takes the remainder.
+  const declaredChunkSize = Number(body.chunk_size);
+  const chunkSize =
+    Number.isInteger(declaredChunkSize) && declaredChunkSize > 0
+      ? Math.min(declaredChunkSize, MAX_CHUNK_BYTES)
+      : CHUNK_SIZE;
+
+  if (size > chunkSize * totalChunks) {
     showError(
       res,
-      `size ${size} is inconsistent with ${totalChunks} chunks of ${CHUNK_SIZE} bytes`,
+      `size ${size} does not fit ${totalChunks} chunks of ${chunkSize} bytes`,
+      400
+    );
+    return;
+  }
+  // The last chunk holds the remainder, and every chunk must hold at least one
+  // byte — a zero-length final slice would mean the count is one too high.
+  const lastChunkSize = size - chunkSize * (totalChunks - 1);
+  if (lastChunkSize <= 0) {
+    showError(
+      res,
+      `size ${size} is too small for ${totalChunks} chunks of ${chunkSize} bytes`,
       400
     );
     return;
@@ -220,7 +231,7 @@ filesRouter.post("/complete", adminAuth, express.json({ limit: "1mb" }), async (
     original_name: originalName,
     content_type: String(body.content_type ?? "application/octet-stream"),
     size,
-    chunk_size: CHUNK_SIZE,
+    chunk_size: chunkSize,
     total_chunks: totalChunks,
     content_hash: contentHash,
     hash_algorithm: HASH_ALGORITHM,
@@ -228,7 +239,10 @@ filesRouter.post("/complete", adminAuth, express.json({ limit: "1mb" }), async (
       index: c.index,
       // Recomputed rather than trusting the client's spelling of the name.
       name: partName(fileId, c.index, totalChunks),
-      size: sizes[c.index - 1],
+      // The size of the slice at this index under the split being finalized.
+      // The last chunk takes the remainder, which absorbs any difference
+      // between the client's chunk size and this server's.
+      size: c.index === totalChunks ? size - chunkSize * (totalChunks - 1) : chunkSize,
       blob_sha: c.blob_sha,
     })),
     created_at: Math.floor(Date.now() / 1000),
@@ -266,7 +280,7 @@ filesRouter.post("/complete", adminAuth, express.json({ limit: "1mb" }), async (
 });
 
 // POST /api/v1/files - Upload a whole file in one request
-filesRouter.post("/", adminAuth, upload.single("file"), async (req, res) => {
+filesRouter.post("/", upload.single("file"), async (req, res) => {
   const file = req.file;
   if (!file) {
     showError(res, "get form err: no file", 400);

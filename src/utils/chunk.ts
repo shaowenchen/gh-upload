@@ -4,25 +4,64 @@ import { createHash } from "node:crypto";
  * Chunk size used when splitting a file across requests.
  *
  * The CDN body limit (100MB on Cloudflare's lower plans) sets the ceiling; this
- * sits far below it. It is not pushed higher because of the memory cost on the
- * receiving end: writing a chunk to GitHub goes through base64 encoding and
- * JSON serialization, which peaks at roughly 7x the chunk size per in-flight
- * request. 16MB keeps a single chunk around 120MB of transient heap, so a few
- * concurrent uploads still fit inside the pod's memory limit.
+ * sits far below it.
+ *
+ * It is not set by the CDN limit but by what a failure costs. Every chunk is a
+ * separate request that can fail on its own, so the chunk size is really the
+ * retry granularity: at 8MB a dropped connection costs 8MB to re-send, whereas
+ * at 32MB it costs four times that. Smaller chunks also let a slow link keep
+ * more requests in flight at once, which is what determines throughput when the
+ * round trip, not the bandwidth, is the constraint.
+ *
+ * The memory cost is what stops it going much lower: writing a chunk to GitHub
+ * goes through base64 encoding and JSON serialization, peaking at roughly 3x
+ * the chunk size per in-flight request. At 8MB that is ~24MB per concurrent
+ * chunk, which the default concurrency below keeps well inside the pod's limit.
+ *
+ * Overridable with CHUNK_SIZE because the right value depends on the deployment
+ * — a direct connection to the API can afford larger chunks than one behind a
+ * flaky CDN edge.
  */
-export const CHUNK_SIZE = 16 * 1024 * 1024; // 16MB
+function resolveChunkSize(): number {
+  const configured = parseInt(process.env.CHUNK_SIZE || "", 10);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  return 8 * 1024 * 1024; // 8MB
+}
+
+export const CHUNK_SIZE = resolveChunkSize();
 
 /**
  * How many chunk bodies the server will process at once, and how many more it
  * will let wait.
  *
- * The browser picks its own request concurrency, and several users upload at
- * the same time, so without a bound here the process memory is a function of
- * client behaviour. Requests beyond the queue limit are refused with a
- * retryable 503 rather than accepted and allowed to exhaust memory.
+ * The browser and the shell script pick their own request concurrency, and
+ * several users upload at the same time, so without a bound here the process
+ * memory is a function of client behaviour. Requests beyond the queue limit are
+ * refused with a retryable 503 rather than accepted and allowed to exhaust
+ * memory.
+ *
+ * This is published through /api/v1/config, so clients size their in-flight
+ * window to what the server will actually accept: a client that asks for more
+ * than this converts its own throughput into 503s and backoff sleeps.
+ *
+ * The default assumes the 1GiB pod limit in deploy/deployment.yaml: at 8MB a
+ * chunk peaks around 24MB of transient heap, so 8 in flight is ~200MB, leaving
+ * room for the response bodies and the rest of the process.
  */
-export const MAX_CONCURRENT_CHUNKS = 2;
-export const MAX_QUEUED_CHUNKS = 32;
+function resolveConcurrency(): number {
+  const configured = parseInt(process.env.MAX_CONCURRENT_CHUNKS || "", 10);
+  if (Number.isFinite(configured) && configured > 0) return configured;
+  return 8;
+}
+
+export const MAX_CONCURRENT_CHUNKS = resolveConcurrency();
+
+/**
+ * Waiting room size. Kept well above the concurrency so a client that briefly
+ * overshoots waits for a slot instead of being turned away — a 503 costs it a
+ * backoff sleep, which is slower than having queued.
+ */
+export const MAX_QUEUED_CHUNKS = 64;
 
 export interface ChunkManifestPart {
   index: number;

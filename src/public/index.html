@@ -93,20 +93,6 @@
       border-radius: 4px; background: #fff; cursor: pointer;
     }
 
-    /* Access token */
-    .token-row {
-      display: flex; align-items: center; gap: 10px; margin-top: 14px;
-      padding: 10px 14px; background: #fff; border: 1px solid #e2e8f0;
-      border-radius: 12px;
-    }
-    .token-row label { font-size: 13px; color: #475569; white-space: nowrap; }
-    .token-row input {
-      flex: 1; min-width: 0; padding: 7px 10px; font-size: 13px;
-      border: 1px solid #dbe4ee; border-radius: 8px; font-family: monospace;
-    }
-    .token-row input:invalid { border-color: #fca5a5; }
-    .token-note { font-size: 12px; color: #94a3b8; }
-
     .upload-actions { display: flex; gap: 8px; margin-top: 12px; justify-content: flex-end; }
     .upload-actions button {
       padding: 8px 20px; border: none; border-radius: 6px;
@@ -304,13 +290,6 @@
       <img class="brand-logo" src="/logo.svg" alt="GH Upload">
     </header>
 
-    <!-- Access token: writes require it, so uploads need it present -->
-    <div class="token-row">
-      <label for="tokenInput">Access token</label>
-      <input type="password" id="tokenInput" placeholder="only needed if the server requires one" autocomplete="off">
-      <span class="token-note" id="tokenNote"></span>
-    </div>
-
     <!-- Upload Zone -->
     <div class="upload-zone" id="dropZone">
       <img class="upload-zone-icon" src="/favicon.svg" alt="">
@@ -364,13 +343,22 @@
 
     // Overwritten from /api/v1/config so the slice size always matches what the
     // server and the CDN edge accept.
-    let CHUNK_SIZE = 32 * 1024 * 1024;
-    // Chunks in flight at once. Blobs are content-addressed and attach to no
-    // ref, so concurrent chunk uploads cannot conflict with each other; the
-    // server also gates how many it processes, and answers 503 when saturated,
-    // which the retry below backs off from.
-    const CHUNK_CONCURRENCY = 2;
-    const CHUNK_MAX_RETRIES = 3;
+    let CHUNK_SIZE = 8 * 1024 * 1024;
+    // Chunks in flight at once, overwritten from /api/v1/config alongside the
+    // chunk size so a client never assumes more capacity than the server
+    // advertises. Blobs are content-addressed and attach to no ref, so
+    // concurrent chunk uploads cannot conflict with each other; the server
+    // also gates how many it processes, and answers 503 when saturated, which
+    // the retry below backs off from.
+    let CHUNK_CONCURRENCY = 4;
+    // An individual chunk is small, so a generous per-request ceiling still
+    // catches a connection that has stalled without failing a slow-but-live
+    // upload — which is the failure that otherwise hangs an upload forever.
+    const CHUNK_TIMEOUT_MS = 120000;
+    // The finalize step runs the real work — one blob per chunk plus a commit —
+    // so it is allowed far longer than a single chunk.
+    const COMPLETE_TIMEOUT_MS = 600000;
+    const CHUNK_MAX_RETRIES = 6;
 
     // ---- Helpers ----
     function humanSize(bytes) {
@@ -395,12 +383,9 @@
         if (json.data && json.data.chunk_size) {
           CHUNK_SIZE = json.data.chunk_size;
         }
-        // Say what the server expects instead of leaving the operator to guess:
-        // an unset token on the server means uploads need no credential.
-        setTokenNote(
-          json.data && json.data.auth_required ? "required by this server" : "not required",
-          false
-        );
+        if (json.data && json.data.max_chunk_concurrency) {
+          CHUNK_CONCURRENCY = json.data.max_chunk_concurrency;
+        }
         // Tell the operator when links stop working, since the page hands them out.
         if (json.data && json.data.signed_links && json.data.link_ttl_seconds) {
           var hrs = Math.round(json.data.link_ttl_seconds / 3600);
@@ -417,7 +402,6 @@
       // Fetch and run the uploader this server hosts, so a shell client never
       // has to reimplement the chunking or guess the limits.
       const script = `export GH_UPLOAD_URL="${apiBaseURL}"
-export GH_UPLOAD_TOKEN="<your access token>"
 
 curl -fsSL "$GH_UPLOAD_URL/upload.sh" -o upload.sh
 bash upload.sh /path/to/file`;
@@ -581,29 +565,6 @@ bash upload.sh /path/to/file`;
       renderQueue();
     });
 
-    // ---- Access token ----
-    // Stored in localStorage for convenience. It is a shared credential, not a
-    // per-user login, so anything running in this browser can read it — fine
-    // for an internal tool, not for a public deployment.
-    var TOKEN_KEY = "gh-upload-token";
-
-    function getToken() {
-      try { return localStorage.getItem(TOKEN_KEY) || ""; } catch (e) { return ""; }
-    }
-
-    function authHeaders(extra) {
-      var t = getToken();
-      var h = extra || {};
-      if (t) h["Authorization"] = "Bearer " + t;
-      return h;
-    }
-
-    function setTokenNote(msg, isError) {
-      var el = document.getElementById("tokenNote");
-      el.textContent = msg || "";
-      el.style.color = isError ? "#ef4444" : "#94a3b8";
-    }
-
     // ---- Upload ----
 
     // No client-side hashing: the file's identity is derived by the server
@@ -622,28 +583,84 @@ bash upload.sh /path/to/file`;
       return "HTTP " + status;
     }
 
-    /** POST one chunk, retrying transient failures with a short backoff. */
+    /**
+     * Send a request with a ceiling on how long it may take.
+     *
+     * fetch has no timeout of its own, so a connection that stalls mid-upload
+     * leaves the promise unsettled forever — the upload never fails and never
+     * finishes, and the progress bar simply stops. A stalled socket is also
+     * exactly what a mobile or proxy-dropped connection looks like, so this is
+     * the common failure rather than an exotic one.
+     */
+    async function fetchWithTimeout(url, options, timeoutMs) {
+      const controller = new AbortController();
+      const timer = setTimeout(function() { controller.abort(); }, timeoutMs);
+      try {
+        return await fetch(url, Object.assign({}, options, { signal: controller.signal }));
+      } catch (e) {
+        // An abort surfaces as a generic AbortError; say what actually happened
+        // so the retry loop's eventual error message is actionable.
+        if (e && e.name === "AbortError") {
+          throw new Error("request timed out after " + Math.round(timeoutMs / 1000) + "s");
+        }
+        throw e;
+      } finally {
+        clearTimeout(timer);
+      }
+    }
+
+    /** Milliseconds to wait before a retry: exponential, jittered, capped. */
+    function backoffMs(attempt, retryAfterHeader) {
+      // Retry-After is the server telling us exactly how long to wait (the load
+      // shedder sets it). Coming back sooner just earns another 503.
+      const hinted = Number(retryAfterHeader);
+      if (isFinite(hinted) && hinted > 0) return Math.min(hinted * 1000, 30000);
+      const base = Math.min(1000 * Math.pow(2, attempt), 15000);
+      // Jittered because every in-flight chunk fails together when the server
+      // sheds load; without it they would all retry in the same instant and
+      // reproduce the overload.
+      return Math.round(base / 2 + Math.random() * (base / 2));
+    }
+
+    /**
+     * POST one chunk, retrying transient failures with backoff.
+     *
+     * A chunk is content-addressed and carries no session state, so resending
+     * it is always safe — which is what makes this the right place to absorb
+     * a failure rather than failing the whole upload.
+     */
     async function sendChunk(blob, uploadId, index, total, entry) {
       for (let attempt = 0; attempt <= CHUNK_MAX_RETRIES; attempt++) {
+        let retryable = true;
+        let retryAfter = null;
         try {
-          const res = await fetch(
+          const res = await fetchWithTimeout(
             uploadURL + "/chunks?upload_id=" + uploadId + "&index=" + index + "&total=" + total,
             { method: "POST", body: blob,
-              // Merged so the Authorization header rides along with the type.
-              headers: authHeaders({ "Content-Type": "application/octet-stream" }) }
+              headers: { "Content-Type": "application/octet-stream" } },
+            CHUNK_TIMEOUT_MS
           );
           const json = await res.json().catch(function() { return null; });
           if (res.ok && json && json.code === 0) return json.data;
-          // 4xx other than 408/429 means retrying cannot help.
-          if (res.status >= 400 && res.status < 500 && res.status !== 408 && res.status !== 429) {
-            throw new Error(parseError(json, res.status));
-          }
+
+          retryAfter = res.headers.get("Retry-After");
           entry.lastError = parseError(json, res.status);
+          // The server states whether a retry is worth attempting; trust it
+          // over the status class, since it knows which failures are transient
+          // on its side (an upstream 502, say) versus a bad request.
+          retryable = json && typeof json.retryable === "boolean"
+            ? json.retryable
+            : (res.status >= 500 || res.status === 408 || res.status === 429);
         } catch (e) {
+          // A network error or a timeout — no response at all. Always worth
+          // retrying: nothing about the request was rejected as wrong.
           entry.lastError = e.message || String(e);
+          retryable = true;
         }
+
+        if (!retryable) throw new Error(entry.lastError || "chunk rejected");
         if (attempt < CHUNK_MAX_RETRIES) {
-          await new Promise(function(r) { setTimeout(r, 500 * Math.pow(2, attempt)); });
+          await new Promise(function(r) { setTimeout(r, backoffMs(attempt, retryAfter)); });
         }
       }
       throw new Error(entry.lastError || "chunk upload failed");
@@ -665,11 +682,24 @@ bash upload.sh /path/to/file`;
         blobs.push(file.slice(i * CHUNK_SIZE, Math.min(file.size, (i + 1) * CHUNK_SIZE)));
       }
 
-      // Chunks are independent (blobs attach to no ref), so a few can be in
-      // flight at once; the commit only happens at /complete.
+      // Chunks are independent (blobs attach to no ref), so several can be in
+      // flight at once; the commit only happens at /complete. The window is
+      // whatever the server published it can process — asking for more only
+      // earns 503s, and asking for fewer leaves its capacity unused.
       const results = new Array(total);
-      let done = 0;
       let next = 0;
+      // A chunk completes in whatever order the network decides, so progress is
+      // summed in bytes and recomputed rather than incremented — a counter
+      // would still be correct, but the byte figure is what the label shows.
+      const doneBytes = new Array(total).fill(0);
+      let completed = 0;
+      const report = function() {
+        let sent = 0;
+        for (let i = 0; i < total; i++) sent += doneBytes[i];
+        entry.progress = Math.min(100, Math.round((sent / file.size) * 100));
+        entry.progressText = completed + " / " + total + " chunks";
+        renderQueue();
+      };
       const workers = new Array(Math.min(CHUNK_CONCURRENCY, total)).fill(0).map(async function() {
         for (;;) {
           const i = next++;
@@ -678,25 +708,34 @@ bash upload.sh /path/to/file`;
           // Only the id matters; the server derives the file's identity and
           // names from it, so the client sends nothing it cannot verify.
           results[i] = data.blob_sha;
-          done += 1;
-          entry.progress = Math.round((done / total) * 100);
-          entry.progressText = done + " / " + total + " chunks";
-          renderQueue();
+          doneBytes[i] = blobs[i].size;
+          completed += 1;
+          report();
         }
       });
-      await Promise.all(workers);
+      try {
+        await Promise.all(workers);
+      } catch (e) {
+        // Report how far it got: "37 of 90 chunks" tells the operator whether
+        // this was a blip or a wall, which a bare message does not.
+        throw new Error(e.message + " (after " + completed + " of " + total + " chunks)");
+      }
 
-      const res = await fetch(uploadURL + "/complete", {
+      const res = await fetchWithTimeout(uploadURL + "/complete", {
         method: "POST",
-        headers: authHeaders({ "Content-Type": "application/json" }),
+        headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           original_name: file.name,
           size: file.size,
           total_chunks: total,
+          // Sent so the server can reconstruct the file even if it is
+          // configured for a different chunk size than this page was loaded
+          // with; it is a big number of round trips to lose otherwise.
+          chunk_size: CHUNK_SIZE,
           content_type: file.type || "application/octet-stream",
           chunks: results
         })
-      });
+      }, COMPLETE_TIMEOUT_MS);
       const json = await res.json().catch(function() { return null; });
       if (!res.ok || !json || json.code !== 0 || !json.data) {
         throw new Error(parseError(json, res.status));
@@ -707,7 +746,13 @@ bash upload.sh /path/to/file`;
     async function uploadSingle(entry) {
       const formData = new FormData();
       formData.append("file", entry.file);
-      const res = await fetch(uploadURL, { method: "POST", body: formData, headers: authHeaders() });
+      // The whole file goes in one body, so the ceiling scales with it rather
+      // than using the per-chunk one: a single-request upload is the slow case.
+      const res = await fetchWithTimeout(
+        uploadURL,
+        { method: "POST", body: formData },
+        COMPLETE_TIMEOUT_MS
+      );
       const json = await res.json().catch(function() { return null; });
       if (!res.ok || !json || json.code !== 0 || !json.data) {
         throw new Error(parseError(json, res.status));
@@ -767,7 +812,7 @@ bash upload.sh /path/to/file`;
       try {
         // Must be a POST now: a GET that wipes the repository can be triggered by
       // any page the operator happens to visit.
-      await fetch(apiBaseURL + "/api/v1/clear", { method: "POST", headers: authHeaders() });
+      await fetch(apiBaseURL + "/api/v1/clear", { method: "POST", headers: {} });
         loadFileList();
       } catch (e) {
         console.error("Error clearing:", e);
@@ -776,16 +821,6 @@ bash upload.sh /path/to/file`;
     });
 
     // ---- Init ----
-    var tokenInput = document.getElementById("tokenInput");
-    tokenInput.value = getToken();
-    tokenInput.addEventListener("input", function() {
-      try {
-        if (this.value) localStorage.setItem(TOKEN_KEY, this.value);
-        else localStorage.removeItem(TOKEN_KEY);
-      } catch (e) { /* storage may be unavailable; the field still works */ }
-      setTokenNote(this.value ? "saved" : "", false);
-    });
-
     loadConfig().then(loadFileList);
   </script>
 </body>

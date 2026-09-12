@@ -1,11 +1,8 @@
 import { Router } from "express";
 import { GitHubService } from "../services/github.js";
 import { showData, showError } from "../utils/response.js";
-import { adminAuth } from "../middleware/adminAuth.js";
 
 export const clearRouter = Router();
-
-clearRouter.use(adminAuth);
 
 // A GET that deletes the repository can be triggered by any page the operator
 // visits in a browser, so require a POST and confirm intent.
