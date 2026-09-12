@@ -147,6 +147,11 @@ export class GitHubService {
   private repoCachedAt = 0;
   /** Repos already known to have a commit, so the probe runs once each. */
   private bootstrapped = new Set<string>();
+  /**
+   * Bootstraps currently running, so concurrent callers await one attempt
+   * instead of racing each other into a duplicate branch creation.
+   */
+  private bootstrapPromises = new Map<string, Promise<void>>();
 
   constructor() {
     this.octokit = new Octokit({
@@ -376,11 +381,46 @@ export class GitHubService {
   private async ensureWritable(repo: RepoInfo): Promise<void> {
     if (this.bootstrapped.has(repo.name)) return;
 
-    const head = await this.getBranchHead(repo);
-    if (head) {
-      this.bootstrapped.add(repo.name);
-      return;
+    // Chunks upload concurrently, so several of them can reach this at once on
+    // a repository that has not been bootstrapped yet. The check above is only
+    // a fast path — the work below awaits several round trips, and every caller
+    // that got past the check before the first one finished would do the whole
+    // bootstrap again. The loser of that race gets GitHub's 409 "reference
+    // already exists" from the branch it just created, and a 409 is not
+    // retryable, so the chunk fails outright.
+    //
+    // One shared promise collapses them: the first caller does the work, the
+    // rest await the same result, and a failure is not cached so the next
+    // caller retries rather than inheriting it.
+    let inFlight = this.bootstrapPromises.get(repo.name);
+    if (!inFlight) {
+      // Recorded only while this attempt is still the registered one. A clear
+      // that lands mid-bootstrap drops the entry, and this check is what stops
+      // the finishing attempt from marking a since-deleted repository as ready
+      // — which would make the next write skip the bootstrap it now needs.
+      const isCurrent = () => this.bootstrapPromises.get(repo.name) === chain;
+      const chain: Promise<void> = this.bootstrap(repo)
+        .then(() => {
+          if (isCurrent()) this.bootstrapped.add(repo.name);
+        })
+        .finally(() => {
+          if (isCurrent()) this.bootstrapPromises.delete(repo.name);
+        });
+      this.bootstrapPromises.set(repo.name, chain);
+      inFlight = chain;
     }
+    await inFlight;
+  }
+
+  /**
+   * Bring the repository into a state where git-data writes will be accepted.
+   *
+   * Two separate preconditions, in order: the repository has to have a commit
+   * at all, and the target branch has to exist.
+   */
+  private async bootstrap(repo: RepoInfo): Promise<void> {
+    const head = await this.getBranchHead(repo);
+    if (head) return;
 
     // The target branch may simply not exist yet on a repo that does have
     // commits — then it only needs to be branched off the default branch.
@@ -390,23 +430,33 @@ export class GitHubService {
     }, repo.defaultBranch);
 
     if (!defaultHead) {
-      const filePath = "README.md";
-      await this.octokit.rest.repos.createOrUpdateFileContents({
-        owner: REPO_OWNER,
-        repo: repo.name,
-        path: filePath,
-        message: "Initialize upload repository",
-        content: Buffer.from(BOOTSTRAP_README, "utf-8").toString("base64"),
-        branch: repo.defaultBranch,
-        author: { name: this.commitName, email: this.commitEmail },
-        committer: { name: this.commitName, email: this.commitEmail },
-      });
-      this.bootstrapped.add(repo.name);
+      // The repository has no commits. The git-data API refuses to write
+      // objects to it, so the first commit has to come from the Contents API,
+      // which does create one.
+      //
+      // A concurrent creator can still win here — another pod, or a retry — and
+      // GitHub answers that with 409. That is the state this method exists to
+      // establish, so it is success, not failure.
+      try {
+        await this.octokit.rest.repos.createOrUpdateFileContents({
+          owner: REPO_OWNER,
+          repo: repo.name,
+          path: "README.md",
+          message: "Initialize upload repository",
+          content: Buffer.from(BOOTSTRAP_README, "utf-8").toString("base64"),
+          branch: repo.defaultBranch,
+          author: { name: this.commitName, email: this.commitEmail },
+          committer: { name: this.commitName, email: this.commitEmail },
+        });
+      } catch (err) {
+        if ((err as { status?: number }).status !== 409) throw err;
+        // Someone else created the branch first; fall through to the branch
+        // creation below, which re-reads the head it produced.
+      }
       if (repo.defaultBranch === this.branch) return;
     }
 
     await this.createBranchIfMissing(repo, repo.defaultBranch);
-    this.bootstrapped.add(repo.name);
   }
 
   /** Point the target branch at the given source branch's head, if absent. */
@@ -429,12 +479,19 @@ export class GitHubService {
       sourceBranch
     );
     if (!source) throw new Error(`source branch has no commits: ${sourceBranch}`);
-    await this.octokit.rest.git.createRef({
-      owner: REPO_OWNER,
-      repo: repo.name,
-      ref: `refs/heads/${this.branch}`,
-      sha: source.commitSha,
-    });
+    try {
+      await this.octokit.rest.git.createRef({
+        owner: REPO_OWNER,
+        repo: repo.name,
+        ref: `refs/heads/${this.branch}`,
+        sha: source.commitSha,
+      });
+    } catch (err) {
+      // Another pod, or a retry, created it between the check above and here.
+      // The branch is the state this method exists to establish, so a 422 from
+      // a losing race is success. Anything else is real.
+      if ((err as { status?: number }).status !== 422) throw err;
+    }
   }
 
   private async getBranchHead(
@@ -562,6 +619,11 @@ export class GitHubService {
     this.repoPromise = null;
     this.repoCachedAt = 0;
     this.bootstrapped.delete(name);
+    // Dropped rather than awaited: a bootstrap still running against the
+    // deleted repository will find its `isCurrent()` check fail and decline to
+    // record anything. Waiting here would block the clear on work that is about
+    // to become irrelevant.
+    this.bootstrapPromises.delete(name);
   }
 }
 
