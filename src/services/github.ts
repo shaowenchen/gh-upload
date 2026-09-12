@@ -332,6 +332,12 @@ export class GitHubService {
    * Uses the recursive tree endpoint rather than the Contents API, which caps
    * its listing at roughly a thousand entries and returns nothing for the rest.
    * Callers that need several paths fetch this once and index into it.
+   *
+   * Throws when the response is truncated rather than returning the partial
+   * listing. GitHub stops walking at its item limit and flags the response
+   * instead of failing, so an unchecked caller would treat "more objects than
+   * fit" as "these are all the objects" — and for the file list that is a
+   * silently incomplete page rather than an error.
    */
   async getTreeEntries(treeSha: string): Promise<Map<string, TreeEntry>> {
     const repo = await this.getOrCreateRepo();
@@ -343,6 +349,12 @@ export class GitHubService {
         recursive: "1",
       })
     );
+
+    if (data.truncated) {
+      throw new Error(
+        `tree ${treeSha} is too large for a single recursive listing; the result would be incomplete`
+      );
+    }
 
     const map = new Map<string, TreeEntry>();
     for (const entry of data.tree) {
@@ -358,12 +370,35 @@ export class GitHubService {
     return head ? head.treeSha : null;
   }
 
-  /** Read one file by path, given a tree sha the caller already holds. */
-  async getFileContent(treeSha: string, path: string): Promise<Buffer> {
-    const entries = await this.getTreeEntries(treeSha);
-    const entry = entries.get(path);
-    if (!entry) throw new Error(`file not found: ${path}`);
-    return this.getBlob(entry.sha);
+  /**
+   * Read one file by path.
+   *
+   * Resolves the path directly with the Contents API rather than walking the
+   * tree and indexing into it. A tree walk is only correct while the response
+   * is untruncated, so a lookup that could not be satisfied from it reported a
+   * file as missing when the file existed — and that lands on the download
+   * path, where the id was issued by this server in the first place.
+   *
+   * The manifest is a few kilobytes, well inside the Contents API's 1MB
+   * inline-content ceiling, so this stays a single request.
+   */
+  async getFileContent(path: string): Promise<Buffer> {
+    const repo = await this.getOrCreateRepo();
+    const { data } = await this.withRetry("getContent", () =>
+      this.octokit.rest.repos.getContent({
+        owner: REPO_OWNER,
+        repo: repo.name,
+        path,
+        ref: this.branch,
+      })
+    );
+
+    // The endpoint answers with an array for a directory and an object for a
+    // file; only the latter carries inline content.
+    if (Array.isArray(data) || data.type !== "file" || typeof data.content !== "string") {
+      throw new Error(`not a file: ${path}`);
+    }
+    return Buffer.from(data.content, "base64");
   }
 
   /**
