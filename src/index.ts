@@ -1,6 +1,7 @@
 import "dotenv/config";
 import express from "express";
 import type { Request, Response, NextFunction } from "express";
+import compression from "compression";
 import { config } from "./config.js";
 import { cors } from "./middleware/cors.js";
 import { domainValidation } from "./middleware/domainValidation.js";
@@ -15,6 +16,11 @@ const app = express();
 
 app.use(domainValidation);
 app.use(cors);
+// The page is one 31KB HTML document with its CSS and JS inline, so compressing
+// it is worth a round trip or two on a slow link. The default filter decides
+// per response and skips types that do not compress, so the binary chunk bodies
+// on the upload path pass through untouched without needing to be excluded.
+app.use(compression());
 
 app.use("/api/v1/files", filesRouter);
 app.use("/api/v1/clear", clearRouter);
@@ -26,7 +32,27 @@ app.get("/health", (_req, res) => {
   res.json({ status: "ok" });
 });
 
-app.use(express.static("dist/public"));
+// Static assets. The HTML is the entry point and carries the client's whole
+// application, so it stays on revalidate-every-time: a cached copy would pin
+// browsers to an older chunk size and upload protocol than the server speaks.
+// Express's ETag makes that a 304 rather than a re-download.
+//
+// The artwork is content-addressed by name and effectively never changes, so it
+// is served as immutable — that is what spares the logo revalidation on every
+// page load.
+app.use(
+  express.static("dist/public", {
+    maxAge: 0,
+    etag: true,
+    setHeaders: (res, filePath) => {
+      if (/\.(svg|png|ico|woff2?)$/.test(filePath)) {
+        res.setHeader("Cache-Control", "public, max-age=604800, immutable");
+      }
+      // upload.sh and llms.txt are read by clients that fetch them fresh each
+      // time on purpose, so they stay on the default revalidate path.
+    },
+  })
+);
 
 /**
  * Convert framework-level failures into the JSON error shape every route uses.

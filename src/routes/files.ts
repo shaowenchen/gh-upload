@@ -497,16 +497,7 @@ filesRouter.get("/:id/download", async (req, res) => {
     // than chunked transfer encoding.
     res.setHeader("Content-Length", manifest.size);
 
-    // Write one chunk at a time. The old code concatenated the whole file into
-    // a single buffer, which for a large file sits right on the pod's memory
-    // limit and fails the download.
-    for (const part of manifest.chunks) {
-      const chunk = await github.getBlob(part.blob_sha);
-      if (!res.write(chunk)) {
-        await new Promise((resolve) => res.once("drain", resolve));
-      }
-    }
-    res.end();
+    await streamChunks(github, manifest, res);
   } catch (err) {
     console.error(err);
     if (!res.headersSent) {
@@ -524,6 +515,82 @@ function asciiFallback(name: string): string {
   return cleaned || "download";
 }
 
+/** Chunk reads kept in flight while streaming a download. */
+const DOWNLOAD_PREFETCH = 4;
+
+/**
+ * Stream a file's chunks to the response in order.
+ *
+ * Chunks are fetched a few ahead of the write cursor so the upstream latency is
+ * paid once rather than once per chunk. A download of N chunks from GitHub pays
+ * N round trips; doing them strictly one after another makes every one of them
+ * additive, which for a chunked file dominates the transfer — the bytes are
+ * small, the latency is not.
+ *
+ * The prefetch is bounded because each in-flight chunk is a base64-decoded
+ * buffer held in memory, so an unbounded lookahead would make a download's
+ * memory a function of its size, which is the failure this replaced.
+ *
+ * Order is what matters, not completion order: chunk i must be written before
+ * chunk i+1, so the fetches overlap but the writes stay sequential. This is why
+ * it is a lookahead rather than a fan-out.
+ */
+async function streamChunks(
+  github: GitHubService,
+  manifest: ChunkManifest,
+  res: Response
+): Promise<void> {
+  // A client that hangs up — cancelling the download, reloading the page,
+  // closing the tab — leaves the response unwritable. Node destroys the socket
+  // without emitting the "drain" a backpressured write is waiting for, so a
+  // loop that waits only on "drain" has nothing to wake it. Handling "close"
+  // alongside it makes the disconnect an exit rather than a wait.
+  let aborted = res.writableEnded || res.destroyed;
+  res.on("close", () => {
+    aborted = true;
+  });
+
+  /** Resolve as soon as the response can be written to again, or is gone. */
+  const waitForDrain = (): Promise<void> =>
+    new Promise((resolve) => {
+      const done = () => {
+        res.off("drain", done);
+        res.off("close", done);
+        resolve();
+      };
+      res.once("drain", done);
+      res.once("close", done);
+    });
+
+  const parts = manifest.chunks;
+  // One slot per chunk, holding the in-flight read for it.
+  const reads: Array<Promise<Buffer>> = new Array(parts.length);
+  let started = 0;
+
+  for (let i = 0; i < parts.length; i++) {
+    // Fill the lookahead window, then wait for the chunk at the write cursor.
+    // Every chunk is started exactly once and awaited exactly once, so the
+    // window slides rather than needing to be drained at the end.
+    while (started < parts.length && started < i + DOWNLOAD_PREFETCH) {
+      reads[started] = github.getBlob(parts[started].blob_sha);
+      started++;
+    }
+
+    const chunk = await reads[i];
+    if (aborted) {
+      // Stop reading from upstream for a client that is no longer there. The
+      // buffers already fetched are dropped with the remaining promises.
+      return;
+    }
+    if (!res.write(chunk)) {
+      await waitForDrain();
+      if (aborted) return;
+    }
+  }
+
+  if (!aborted) res.end();
+}
+
 async function loadManifest(
   github: GitHubService,
   fileId: string
@@ -535,13 +602,6 @@ async function loadManifest(
   return JSON.parse(bytes.toString("utf-8")) as ChunkManifest;
 }
 
-/**
- * Build a URL for a hosted endpoint.
- *
- * Prefers the configured public hostname: req.headers.host is whatever the
- * caller dialled, which for an in-cluster client is a .svc address that nothing
- * outside the cluster can resolve.
- */
 /**
  * Build a signed download URL for a file.
  *
