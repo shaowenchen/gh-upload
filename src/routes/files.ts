@@ -4,7 +4,8 @@ import express from "express";
 import multer from "multer";
 import os from "node:os";
 import { unlink, readFile } from "node:fs/promises";
-import { GitHubService } from "../services/github.js";
+import { githubService } from "../services/github.js";
+import type { GitHubService } from "../services/github.js";
 import { showData, showError } from "../utils/response.js";
 import { config } from "../config.js";
 import {
@@ -123,7 +124,7 @@ filesRouter.post(
     }
 
     try {
-      const github = new GitHubService();
+      const github = githubService();
       const blobSha = await github.createBlob(body);
       showData(res, {
         upload_id: uploadId,
@@ -249,7 +250,7 @@ filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) =
   };
 
   try {
-    const github = new GitHubService();
+    const github = githubService();
     const manifestBlob = await github.createBlob(
       Buffer.from(JSON.stringify(manifest, null, 2), "utf-8")
     );
@@ -300,7 +301,7 @@ filesRouter.post("/", upload.single("file"), async (req, res) => {
       return;
     }
 
-    const github = new GitHubService();
+    const github = githubService();
     const content = await readFile(file.path);
     const blobSha = await github.createBlob(content);
     const contentHash = contentHashFromBlobs([blobSha]);
@@ -362,7 +363,7 @@ filesRouter.post("/", upload.single("file"), async (req, res) => {
 
 // GET /api/v1/files - List files
 filesRouter.get("/", async (req, res) => {
-  const github = new GitHubService();
+  const github = githubService();
   try {
     const repo = await github.getOrCreateRepo();
     const treeSha = await github.getBranchTreeSha(repo);
@@ -430,7 +431,7 @@ filesRouter.get("/:id", async (req, res) => {
     return;
   }
 
-  const github = new GitHubService();
+  const github = githubService();
   try {
     const manifest = await loadManifest(github, fileId);
     showData(res, {
@@ -480,7 +481,7 @@ filesRouter.get("/:id/download", async (req, res) => {
     return;
   }
 
-  const github = new GitHubService();
+  const github = githubService();
   try {
     const manifest = await loadManifest(github, fileId);
 

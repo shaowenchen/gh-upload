@@ -102,6 +102,41 @@ export interface TreeEntry {
   size: number;
 }
 
+/**
+ * Blob reads kept in memory, keyed by sha.
+ *
+ * A git blob sha is the hash of its content, so this entry cannot go stale: if
+ * the content changed, the sha would be different and this would be a different
+ * entry. That is why there is no TTL here — correctness comes from
+ * content-addressing, not from an expiry guess.
+ *
+ * Only blobs below the size cutoff are kept. A manifest is a few kilobytes; a
+ * chunk is megabytes, and caching those would put a file's whole contents in
+ * the heap to save one round trip.
+ *
+ * Bounded in bytes rather than entries, because the entries vary in size by
+ * orders of magnitude and what actually has to stay bounded is the heap.
+ */
+const BLOB_CACHE_MAX_BYTES = 8 * 1024 * 1024;
+const BLOB_CACHE_MAX_ENTRY_BYTES = 256 * 1024;
+
+/**
+ * The cache itself, at module scope rather than per instance.
+ *
+ * It has to outlive a request to be worth anything — listing fetches the same
+ * manifests on every call — and it is safe to share across instances because it
+ * is global to the deployment rather than scoped to one. It is shared across
+ * callers deliberately: the data is a pure function of the sha, so there is
+ * nothing to leak between them.
+ */
+const blobCache = new Map<string, Buffer>();
+let blobCacheBytes = 0;
+
+/** Cached blob bytes, for tests and diagnostics. */
+export function blobCacheStats(): { entries: number; bytes: number } {
+  return { entries: blobCache.size, bytes: blobCacheBytes };
+}
+
 export class GitHubService {
   private octokit: Octokit;
   private branch: string;
@@ -247,6 +282,18 @@ export class GitHubService {
    * has no way to resume.
    */
   async getBlob(sha: string): Promise<Buffer> {
+    const cached = blobCache.get(sha);
+    if (cached !== undefined) {
+      // Refresh recency: deleting and re-setting moves the entry to the end of
+      // the Map's insertion order, which is what makes the eviction below
+      // least-recently-used rather than first-in-first-out. Without this a file
+      // listed on every page load could be evicted ahead of one read once. The
+      // byte counter is untouched because the buffer is the same one.
+      blobCache.delete(sha);
+      blobCache.set(sha, cached);
+      return cached;
+    }
+
     const repo = await this.getOrCreateRepo();
     const { data } = await this.withRetry("getBlob", () =>
       this.octokit.rest.git.getBlob({
@@ -255,7 +302,23 @@ export class GitHubService {
         file_sha: sha,
       })
     );
-    return Buffer.from(data.content, "base64");
+    const content = Buffer.from(data.content, "base64");
+
+    // Only worth holding if it is small. The budget is enforced by evicting the
+    // least recently used entry, which is at the front of the Map's order.
+    if (content.length <= BLOB_CACHE_MAX_ENTRY_BYTES) {
+      blobCache.delete(sha);
+      blobCache.set(sha, content);
+      blobCacheBytes += content.length;
+      while (blobCacheBytes > BLOB_CACHE_MAX_BYTES && blobCache.size > 1) {
+        const oldest = blobCache.keys().next();
+        if (oldest.done || oldest.value === sha) break;
+        const evicted = blobCache.get(oldest.value);
+        blobCache.delete(oldest.value);
+        blobCacheBytes -= evicted?.length ?? 0;
+      }
+    }
+    return content;
   }
 
   /**
@@ -482,5 +545,41 @@ export class GitHubService {
       owner: REPO_OWNER,
       repo: repo.name,
     });
+    // The caches now describe a repository that does not exist. Leaving them
+    // would make the next request use a stale repo for up to the cache TTL, and
+    // `bootstrapped` would claim the repository already has a commit when the
+    // next write has to recreate it from nothing.
+    this.forgetRepo(repo.name);
   }
+
+  /**
+   * Drop everything cached about a repository.
+   *
+   * Called when the repository is deleted; a shared service instance would
+   * otherwise serve the deleted repository's identity until the TTL expired.
+   */
+  private forgetRepo(name: string): void {
+    this.repoPromise = null;
+    this.repoCachedAt = 0;
+    this.bootstrapped.delete(name);
+  }
+}
+
+/**
+ * The service instance the routes share.
+ *
+ * Every route used to construct its own, which meant the repo, org and
+ * bootstrap caches in here were rebuilt from scratch on every request and never
+ * outlived the one that created them — so each request paid the org probe and
+ * the repo lookup again. A single instance is what makes those caches actually
+ * cache.
+ *
+ * It is safe to share: the only mutable state is those caches, and the config
+ * it reads is fixed for the process's lifetime.
+ */
+let shared: GitHubService | null = null;
+
+export function githubService(): GitHubService {
+  if (!shared) shared = new GitHubService();
+  return shared;
 }
