@@ -93,6 +93,53 @@ export function sanitizeFilename(name: string): string {
   return cleaned;
 }
 
+/**
+ * Repair a filename whose UTF-8 bytes were read as Latin-1.
+ *
+ * busboy, which multer parses multipart bodies with, decodes the `filename`
+ * parameter as Latin-1 instead of UTF-8. A browser sends the name as raw UTF-8
+ * bytes, so "平凡.pdf" arrives as "å¹³å¡.pdf" — every byte of the original
+ * promoted to its own code point. The name is not merely displayed: it becomes
+ * the file's storage path, so the damaged spelling is what gets committed and
+ * what every link derived from it carries.
+ *
+ * The repair inverts that: narrow each code point back to a byte, then read the
+ * bytes as UTF-8. It is applied only when the name is entirely Latin-1 *and*
+ * survives the round trip, which is what keeps it off names that are not
+ * damaged — an ASCII name never matches the first test, and a genuinely
+ * Latin-1 name ("café.pdf", one byte per accented character, decoded
+ * correctly by busboy) decodes back non-UTF-8 and is left alone. A name whose
+ * bytes are not valid UTF-8 would decode to replacement characters, so those
+ * are kept as received rather than silently corrupted.
+ */
+export function normalizeFilename(name: string): string {
+  // No byte was promoted, or the name is already beyond Latin-1 — either way
+  // there is nothing busboy could have damaged.
+  if (!/^[\x00-\xff]*$/.test(name) || !/[\x80-\xff]/.test(name)) return name;
+  const decoded = Buffer.from(name, "latin1").toString("utf8");
+  // Replacement characters mean those bytes were not UTF-8 to begin with, so
+  // the original is the more faithful of the two.
+  if (decoded.includes("�")) return name;
+  return decoded;
+}
+
+/**
+ * Percent-encode a name for the RFC 5987 `filename*` parameter.
+ *
+ * `encodeURIComponent` leaves `!'()*` literal. Those are legal in an extended
+ * parameter, but an apostrophe especially is not worth the ambiguity: it is the
+ * delimiter the parameter itself is built from, and a parser that splits on it
+ * rather than scanning from the charset prefix reads the rest as a language
+ * tag. Narrowing the set to unreserved characters costs a few bytes and leaves
+ * nothing for a parser to guess at.
+ */
+export function encodeRFC5987(name: string): string {
+  return encodeURIComponent(name).replace(
+    /['()!*]/g,
+    (c) => "%" + c.charCodeAt(0).toString(16).toUpperCase()
+  );
+}
+
 export function partName(fileId: string, index: number, total: number): string {
   const width = Math.max(6, String(total).length);
   return `${fileId}.part.${String(index).padStart(width, "0")}-of-${String(total).padStart(width, "0")}`;

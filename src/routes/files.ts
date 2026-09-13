@@ -17,6 +17,8 @@ import {
   isValidFileId,
   isValidUploadId,
   sanitizeFilename,
+  normalizeFilename,
+  encodeRFC5987,
   isManifestName,
   manifestName,
   partName,
@@ -284,7 +286,7 @@ filesRouter.post("/", upload.single("file"), async (req, res) => {
     return;
   }
 
-  const originalName = sanitizeFilename(file.originalname);
+  const originalName = sanitizeFilename(normalizeFilename(file.originalname));
 
   try {
     if (file.size > MAX_SIMPLE_UPLOAD) {
@@ -517,7 +519,7 @@ filesRouter.get("/:prefix/:name", async (req, res) => {
       "Content-Disposition",
       `${previewing ? "inline" : "attachment"}; ` +
         `filename="${asciiFallback(manifest.original_name)}"; ` +
-        `filename*=UTF-8''${encodeURIComponent(manifest.original_name)}`
+        `filename*=UTF-8''${encodeRFC5987(manifest.original_name)}`
     );
     // The manifest knows the total size, so this stays a plain response rather
     // than chunked transfer encoding.
