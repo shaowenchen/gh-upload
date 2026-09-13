@@ -68,6 +68,27 @@ function retryDelayMs(attempt: number, retryAfterHeader?: string): number {
 }
 
 /**
+ * Whether a failed call's answer was "there is nothing there".
+ *
+ * Two statuses mean that, and both have to be read as one because they are the
+ * same state seen from different endpoints. A missing repository or ref is a
+ * 404. An existing repository with no commits at all is a 409 — GitHub words it
+ * "Git Repository is empty", and it comes back from any ref or object read,
+ * because a repository with no commit has no refs to look up. That is exactly
+ * the state bootstrap exists to repair, so reading only the 404 treats a
+ * brand-new repository as an unanswerable error and fails the first upload to
+ * it.
+ *
+ * Everything else — 401, 403, 429, 5xx, a dropped connection — is a failure to
+ * ask, which is not the same as being told there is nothing, and must not be
+ * mistaken for it.
+ */
+function isEmptyAnswer(err: unknown): boolean {
+  const status = (err as { status?: number }).status;
+  return status === 404 || status === 409;
+}
+
+/**
  * Committed as the repository's first commit, to bring it into existence.
  * The git-data API cannot write to a repository with no commits, so something
  * has to be committed first — this says what the repository holds.
@@ -547,12 +568,13 @@ export class GitHubService {
       });
       return; // already there
     } catch (err) {
-      // Only a 404 means the branch is absent and wants creating. A 401, a
-      // rate limit or a dropped connection means this request never learned
-      // whether it exists, and falling through on one of those creates a ref
-      // that may already be there — or reports "source branch has no commits"
-      // for a repository whose access was the actual problem.
-      if ((err as { status?: number }).status !== 404) throw err;
+      // Only "there is no such branch" means it wants creating, which a 404
+      // says directly and a 409 says from an empty repository. A 401, a rate
+      // limit or a dropped connection means this request never learned whether
+      // the ref exists, and falling through on one of those creates a ref that
+      // may already be there — or reports "source branch has no commits" for a
+      // repository whose access was the actual problem.
+      if (!isEmptyAnswer(err)) throw err;
     }
     const source = await this.getBranchHead(
       { name: repo.name, defaultBranch: sourceBranch },
@@ -602,11 +624,12 @@ export class GitHubService {
     } catch (err) {
       // A 404 is the answer this method exists to return null for: the branch,
       // the repository, or every commit in it is absent, and the callers read
-      // null as "nothing there yet" and lay a foundation. Anything else — a
+      // null as "nothing there yet" and lay a foundation. A 409 says the same
+      // thing from an empty repository — see isEmptyAnswer. Anything else — a
       // token that cannot read the repository, a rate limit, an upstream
       // failure — is not that, and swallowing it would send the bootstrap
       // below off to create a branch on a repository it was never able to read.
-      if ((err as { status?: number }).status !== 404) throw err;
+      if (!isEmptyAnswer(err)) throw err;
       return null;
     }
   }
