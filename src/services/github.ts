@@ -209,7 +209,7 @@ export class GitHubService {
   private async createRepo(isOrg: boolean): Promise<RepoInfo> {
     const params = {
       name: REPO_NAME,
-      private: false,
+      private: config.github.repoPrivate,
       auto_init: false,
       default_branch: this.branch,
     } as const;

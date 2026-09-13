@@ -37,6 +37,11 @@ spec:
               value: "auto@auto.com"
             - name: GITHUB_COMMIT_NAME
               value: "none"
+            # Visibility for a repository this service creates. Applies at
+            # creation only — an existing repository keeps its current
+            # visibility, so change that one on GitHub.
+            - name: GITHUB_REPO_PRIVATE
+              value: "true"
             # Signing secret for download links. Empty = links never expire.
             #   kubectl -n ops-system create secret generic gh-upload \
             #     --from-literal=download-secret="$(openssl rand -hex 32)"

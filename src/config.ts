@@ -9,6 +9,8 @@ export interface Config {
     apiBase: string;
     commitEmail: string;
     commitName: string;
+    /** Visibility to give a repository this service creates. */
+    repoPrivate: boolean;
   };
   downloadUrls: string[];
   /** HMAC secret for signed download links; empty disables signing. */
@@ -28,6 +30,11 @@ function loadConfig(): Config {
       apiBase: process.env.GITHUB_API_BASE || "https://api.github.com",
       commitEmail: process.env.GITHUB_COMMIT_EMAIL || "auto@auto.com",
       commitName: process.env.GITHUB_COMMIT_NAME || "none",
+      // Private by default: a repository this service creates holds whatever
+      // was uploaded to it, and nothing about an upload is a decision to
+      // publish. Only an explicit "false" opens it up, so a typo or an empty
+      // value fails closed rather than exposing the contents.
+      repoPrivate: (process.env.GITHUB_REPO_PRIVATE || "true").toLowerCase() !== "false",
     },
     downloadUrls: (process.env.DOWNLOAD_URLS || "")
       .split(",")
