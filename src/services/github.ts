@@ -168,7 +168,14 @@ export class GitHubService {
     try {
       await this.octokit.rest.orgs.get({ org: REPO_OWNER });
       this.isOrg = true;
-    } catch {
+    } catch (err) {
+      // A 404 is the real "this owner is a user, not an organisation". Any
+      // other failure — a rate limit, an expired token, an upstream 5xx, a
+      // dropped connection — says nothing about what the owner is, and
+      // answering "user" here decides which create call the repo resolution
+      // below reaches for. That comment says the owner is a user and takes
+      // the create call down with it.
+      if ((err as { status?: number }).status !== 404) throw err;
       this.isOrg = false;
     }
     return this.isOrg;
@@ -196,12 +203,27 @@ export class GitHubService {
   private async resolveRepo(): Promise<RepoInfo> {
     const isOrg = await this.checkIsOrg();
     try {
-      const { data: repo } = await this.octokit.rest.repos.get({
-        owner: REPO_OWNER,
-        repo: REPO_NAME,
-      });
+      // Retried, like every other GitHub call this service makes. Without it a
+      // single blip here reads as "the repository is gone" and sends the caller
+      // down the create path below, where the only possible answer is a 422
+      // saying the name is taken — an error that names the wrong problem.
+      const { data: repo } = await this.withRetry("getRepo", () =>
+        this.octokit.rest.repos.get({
+          owner: REPO_OWNER,
+          repo: REPO_NAME,
+        })
+      );
       return { name: repo.name, defaultBranch: repo.default_branch };
-    } catch {
+    } catch (err) {
+      // Only a 404 means "there is no repository here" and justifies creating
+      // one. GitHub answers 404 rather than 403 for a private repository the
+      // token cannot see, which is why this cannot stay a bare catch: a
+      // token missing the repository would otherwise be read as its absence
+      // and fail at create with a 422 about the name being taken — an error
+      // that never mentions the token. 401 and 403 are the real answers to
+      // give back, and a 5xx or a dropped connection is retried above before
+      // it ever lands here.
+      if ((err as { status?: number }).status !== 404) throw err;
       return this.createRepo(isOrg);
     }
   }
@@ -214,9 +236,27 @@ export class GitHubService {
       default_branch: this.branch,
     } as const;
 
-    const { data: repo } = isOrg
-      ? await this.octokit.rest.repos.createInOrg({ ...params, org: REPO_OWNER })
-      : await this.octokit.rest.repos.createForAuthenticatedUser(params);
+    let repo;
+    try {
+      ({ data: repo } = isOrg
+        ? await this.octokit.rest.repos.createInOrg({ ...params, org: REPO_OWNER })
+        : await this.octokit.rest.repos.createForAuthenticatedUser(params));
+    } catch (err) {
+      // A 422 here almost always means the name is already taken by a private
+      // repository this token cannot see. Resolution only reaches this point
+      // on a 404, and GitHub answers 404 — not 403 — for a private repository
+      // the caller is not authorised to read, so "taken" and "invisible" are
+      // the same answer from the API and only this hint tells them apart. It
+      // is added to the message, not thrown in its place, so nothing about the
+      // original failure is lost.
+      if ((err as { status?: number }).status === 422) {
+        (err as Error).message +=
+          ` — ${REPO_OWNER}/${REPO_NAME} could not be created and could not be read. ` +
+          `If it exists and is private, the token lacks access to it: grant it, ` +
+          `or point GITHUB_REPO at a repository it can reach.`;
+      }
+      throw err;
+    }
 
     return { name: repo.name, defaultBranch: repo.default_branch };
   }
@@ -506,8 +546,13 @@ export class GitHubService {
         ref: `heads/${this.branch}`,
       });
       return; // already there
-    } catch {
-      // fall through to create it
+    } catch (err) {
+      // Only a 404 means the branch is absent and wants creating. A 401, a
+      // rate limit or a dropped connection means this request never learned
+      // whether it exists, and falling through on one of those creates a ref
+      // that may already be there — or reports "source branch has no commits"
+      // for a repository whose access was the actual problem.
+      if ((err as { status?: number }).status !== 404) throw err;
     }
     const source = await this.getBranchHead(
       { name: repo.name, defaultBranch: sourceBranch },
@@ -535,19 +580,33 @@ export class GitHubService {
   ): Promise<{ commitSha: string; treeSha: string } | null> {
     const target = branch ?? this.branch;
     try {
-      const { data: ref } = await this.octokit.rest.git.getRef({
-        owner: REPO_OWNER,
-        repo: repo.name,
-        ref: `heads/${target}`,
-      });
-      const { data: commit } = await this.octokit.rest.git.getCommit({
-        owner: REPO_OWNER,
-        repo: repo.name,
-        commit_sha: ref.object.sha,
-      });
+      // Retried for the same reason every other read is: this sits on the
+      // commit path, so one blip otherwise fails an upload that a pause would
+      // have carried through. A 404 is not retryable, so the absent-branch
+      // case still returns immediately below.
+      const { data: ref } = await this.withRetry("getRef", () =>
+        this.octokit.rest.git.getRef({
+          owner: REPO_OWNER,
+          repo: repo.name,
+          ref: `heads/${target}`,
+        })
+      );
+      const { data: commit } = await this.withRetry("getCommit", () =>
+        this.octokit.rest.git.getCommit({
+          owner: REPO_OWNER,
+          repo: repo.name,
+          commit_sha: ref.object.sha,
+        })
+      );
       return { commitSha: ref.object.sha, treeSha: commit.tree.sha };
-    } catch {
-      // Branch (or repo) does not exist, or the repo has no commits at all.
+    } catch (err) {
+      // A 404 is the answer this method exists to return null for: the branch,
+      // the repository, or every commit in it is absent, and the callers read
+      // null as "nothing there yet" and lay a foundation. Anything else — a
+      // token that cannot read the repository, a rate limit, an upstream
+      // failure — is not that, and swallowing it would send the bootstrap
+      // below off to create a branch on a repository it was never able to read.
+      if ((err as { status?: number }).status !== 404) throw err;
       return null;
     }
   }

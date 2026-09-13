@@ -21,3 +21,29 @@ export function showError(
 ): void {
   res.status(status).json({ code: -1, msg, retryable });
 }
+
+/**
+ * Report a GitHub failure with the status it actually carried.
+ *
+ * The service reaches GitHub with one token, so when that token is refused or
+ * rate-limited — 401, 403, 429 — the failure is the deployment's to fix, not
+ * the caller's, and the distinction matters to whoever reads the error: a bare
+ * 502 says "try again later", which for an unauthorised token is advice that
+ * can never work. Anything that is not one of those upstream answers stays a
+ * 502, and only a 5xx or a rate limit is worth retrying.
+ */
+export function showUpstreamError(res: Response, context: string, err: unknown): void {
+  const status = (err as { status?: number }).status;
+  if (status === 401 || status === 403 || status === 429) {
+    showError(
+      res,
+      `${context}: GitHub refused the request (${status}). Check GITHUB_TOKEN's ` +
+        `permissions and the API rate limit.`,
+      status,
+      status === 429
+    );
+    return;
+  }
+  showError(res, context, 502, status === undefined || status >= 500);
+}
+

@@ -6,7 +6,7 @@ import os from "node:os";
 import { unlink, readFile } from "node:fs/promises";
 import { githubService } from "../services/github.js";
 import type { GitHubService } from "../services/github.js";
-import { showData, showError } from "../utils/response.js";
+import { showData, showError, showUpstreamError } from "../utils/response.js";
 import { config } from "../config.js";
 import {
   CHUNK_SIZE,
@@ -148,7 +148,7 @@ filesRouter.post(
       });
     } catch (err) {
       console.error(err);
-      showError(res, "upload chunk failed", 502, true);
+      showUpstreamError(res, "upload chunk failed", err);
     }
   }
 );
@@ -274,7 +274,7 @@ filesRouter.post("/complete", express.json({ limit: "1mb" }), async (req, res) =
     });
   } catch (err) {
     console.error(err);
-    showError(res, "finalize upload failed", 502);
+    showUpstreamError(res, "finalize upload failed", err);
   }
 });
 
@@ -350,7 +350,7 @@ filesRouter.post("/", upload.single("file"), async (req, res) => {
     });
   } catch (err) {
     console.error(err);
-    showError(res, "upload file err", 502);
+    showUpstreamError(res, "upload file err", err);
   } finally {
     unlink(file.path).catch(() => {});
   }
@@ -412,7 +412,7 @@ filesRouter.get("/", async (req, res) => {
     showData(res, { list: result });
   } catch (err) {
     console.error(err);
-    showError(res, "list files err", 502);
+    showUpstreamError(res, "list files err", err);
   }
 });
 
